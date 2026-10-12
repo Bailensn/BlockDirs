@@ -50,7 +50,38 @@ jobs:
         uses: gradle/actions/setup-gradle@v6
 
       - name: Build release APK
-        run: ./gradlew assembleRelease --no-daemon --stacktrace
+        run: |
+          set -o pipefail
+          # 同时落盘一份日志，失败时下面那步会把关键错误行贴出来
+          ./gradlew assembleRelease --no-daemon --stacktrace 2>&1 | tee build.log
+
+      # 失败时把真正报错的行写进 job summary，并以 annotation 形式发出去。
+      # annotation 无需登录即可通过 REST API 读取（/check-runs/<id>/annotations），
+      # 方便远程定位（AGP 的原生构建输出都带 "C/C++:" 前缀，GitHub 自己解析不出来）。
+      - name: Dump build errors
+        if: failure()
+        run: |
+          {
+            echo '## 构建失败：关键错误行'
+            echo '```text'
+            grep -aE 'error:|e: |FAILURE:|What went wrong|Caused by:|> Task .* FAILED|fatal:|CMake Error' build.log 2>/dev/null | head -n 80 || true
+            echo '```'
+            echo '## 日志尾部'
+            echo '```text'
+            tail -n 60 build.log 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+          i=0
+          while IFS= read -r line; do
+            if [ -z "$line" ]; then continue; fi
+            msg=${line//'%'/'%25'}
+            msg=${msg//$'\r'/}
+            echo "::error title=ci::${msg}"
+            i=$((i + 1))
+            if [ "$i" -ge 10 ]; then break; fi
+          done < <(grep -aE 'error:|e: |FAILURE:|What went wrong|Caused by:|> Task .* FAILED|CMake Error' build.log 2>/dev/null | head -n 10 || true)
+          exit 0
 
       # 关键闸门：只有真的产出了合法 APK 才把 apk_ok 置为 true，
       # release 任务据此决定是否发布（构建失败 / 产物缺失一律不发布）

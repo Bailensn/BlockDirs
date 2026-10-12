@@ -1,10 +1,8 @@
 #include <jni.h>
-#include <limits.h>
-#include <cstdio>
-#include <cstring>
+#include <string.h>
+#include <stdio.h>
 #include <cstdlib>
 #include <dlfcn.h>
-#include <fcntl.h>
 #include <unistd.h>
 #include <android/log.h>
 #include <sys/stat.h>
@@ -15,6 +13,11 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+
+// 路径缓冲上限。
+// 刻意不依赖 PATH_MAX：不同 libc 把它放在 <limits.h> / <sys/param.h> / <linux/limits.h>
+// 的位置不一致，自己定一个常量最省事。
+#define BLOCKDIRS_MAX_PATH 4096
 
 // 原始函数指针（由 shadowhook 回填）
 static int (*orig_mkdir)(const char *, mode_t) = nullptr;
@@ -37,9 +40,9 @@ static bool is_top_level_on_external(const char *path) {
     }
 
     // 去掉尾部 '/'（mkdir("/a/b/") 与 mkdir("/a/b") 语义相同）
-    static thread_local char norm[PATH_MAX];
+    char norm[BLOCKDIRS_MAX_PATH];
     size_t len = strlen(path);
-    if (len == 0 || len >= sizeof(norm)) {
+    if (len >= sizeof(norm)) {
         return false;
     }
     memcpy(norm, path, len + 1);
@@ -57,18 +60,18 @@ static bool is_top_level_on_external(const char *path) {
         base = norm + 12;
     } else if (strncmp(norm, "/mnt/user/", 10) == 0) {
         // /mnt/user/<userId>/<UUID>/<name> —— 跳过 userId 这一层
-        const char *slash = strchr(norm + 10, '/');
-        if (slash == nullptr) {
+        const char *sep = strchr(norm + 10, '/');
+        if (sep == nullptr) {
             return false;
         }
-        base = slash + 1;
+        base = sep + 1;
     } else if (strncmp(norm, "/mnt/runtime/", 13) == 0) {
         // /mnt/runtime/<access>/<UUID>/<name> —— 跳过 access 这一层
-        const char *slash = strchr(norm + 13, '/');
-        if (slash == nullptr) {
+        const char *sep = strchr(norm + 13, '/');
+        if (sep == nullptr) {
             return false;
         }
-        base = slash + 1;
+        base = sep + 1;
     } else {
         return false;
     }
@@ -107,24 +110,23 @@ static bool is_top_level_on_external_at(int dirfd, const char *path) {
         return is_top_level_on_external(path);
     }
 
-    static thread_local char resolved[PATH_MAX];
-
-    if (dirfd == AT_FDCWD) {
-        if (getcwd(resolved, sizeof(resolved)) == nullptr) {
-            return false;
-        }
-    } else {
-        char link[64];
-        snprintf(link, sizeof(link), "/proc/self/fd/%d", dirfd);
-        ssize_t n = readlink(link, resolved, sizeof(resolved) - 1);
-        if (n <= 0) {
-            return false;
-        }
-        resolved[n] = '\0';
+    // 相对 CWD 的调用（AT_FDCWD）与我们的目标无关，直接放过
+    if (dirfd < 0) {
+        return false;
     }
 
+    char link[32];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", dirfd);
+
+    char resolved[BLOCKDIRS_MAX_PATH];
+    ssize_t got = readlink(link, resolved, sizeof(resolved) - 1);
+    if (got <= 0) {
+        return false;
+    }
+    resolved[got] = '\0';
+
     // 拼接成 "<resolved>/<path>"
-    size_t base_len = strlen(resolved);
+    size_t base_len = (size_t) got;
     size_t name_len = strlen(path);
     if (base_len == 0 || base_len + 1 + name_len >= sizeof(resolved)) {
         return false;
@@ -167,18 +169,18 @@ Java_top_yixiangren_blockdirs_nativebridge_BlockDirsNative_installNativeHook(JNI
 
     // Hook libc 的 mkdir
     void *mkdir_stub = shadowhook_hook_sym_name(
-            "libc.so", "mkdir", (void *)my_mkdir, (void **)&orig_mkdir);
+            "libc.so", "mkdir", (void *) my_mkdir, (void **) &orig_mkdir);
     if (mkdir_stub != nullptr) {
-        LOGI("mkdir hooked, orig=%p", (void *)orig_mkdir);
+        LOGI("mkdir hooked, orig=%p", (void *) orig_mkdir);
     } else {
         LOGE("mkdir hook failed");
     }
 
     // Hook libc 的 mkdirat
     void *mkdirat_stub = shadowhook_hook_sym_name(
-            "libc.so", "mkdirat", (void *)my_mkdirat, (void **)&orig_mkdirat);
+            "libc.so", "mkdirat", (void *) my_mkdirat, (void **) &orig_mkdirat);
     if (mkdirat_stub != nullptr) {
-        LOGI("mkdirat hooked, orig=%p", (void *)orig_mkdirat);
+        LOGI("mkdirat hooked, orig=%p", (void *) orig_mkdirat);
     } else {
         LOGE("mkdirat hook failed");
     }

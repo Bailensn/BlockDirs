@@ -8,11 +8,15 @@ include(FetchContent)
 # shadowhook：字节跳动开源 Android inline hook 库
 # 库的 CMakeLists 位于仓库的 shadowhook/src/main/cpp 子目录，根目录没有，
 # 所以必须用 SOURCE_SUBDIR 指向它。
+#
+# 刻意把 GIT_TAG 钉死到具体 commit（而不是跟随 main）：
+# 上游 main 一动，这边的构建就会莫名其妙地变红，且难以复现。
+# 该 commit = main 在 2026-08-26 的 HEAD。
 FetchContent_Declare(
     shadowhook
     GIT_REPOSITORY https://github.com/bytedance/android-inline-hook.git
-    GIT_TAG main
-    GIT_SHALLOW TRUE
+    GIT_TAG 593f491be68799f03ee3bab71ce5908846437147
+    GIT_SHALLOW FALSE
 )
 
 # 手动 Populate（而非 MakeAvailable），这样可以在 shadowhook 的
