@@ -110,6 +110,14 @@ top.yixiangren.blockdirs/
 构建产物会自动发布为 GitHub Release，tag 形如 `92-git+03d914ec`（= `git rev-list --count` + 短 hash），
 与 App 内「检查更新」的版本号约定一致。
 
+工作流分三个任务，**Release 只在构建产物校验通过之后才会创建**：
+
+1. `build`：构建 APK → 校验（存在 / 非空 / 合法 zip）→ 归档为 workflow artifact，本身不碰 Release；
+2. `release`：`needs: build` 且 `apk_ok == true` 才执行，下载 artifact 再校验一次，之后才清理旧的 tag/release 并发布；
+3. `publish-mirror`（可选）：`needs: [build, release]`，从刚发布的 Release 下载 APK 同步到 LSPosed 模块仓库。
+
+因此构建失败、产物缺失或产出坏文件时，既不会创建新 Release，也不会先把已有 Release 删掉。
+
 > **Fork 用户注意**：GitHub 会默认关闭 fork 仓库的 Actions。首次需要到 `Actions` 页面点一次
 > 「I understand my workflows, go ahead and enable them」，否则 push 后不会产生任何构建（运行记录恒为 0）。
 

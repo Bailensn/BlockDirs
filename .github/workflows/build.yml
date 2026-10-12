@@ -14,12 +14,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # ── 1) 只负责「构建 + 校验 + 归档产物」，完全不碰 Release ────────────────
   build:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.version.outputs.tag }}
       vc: ${{ steps.version.outputs.vc }}
       vn: ${{ steps.version.outputs.vn }}
+      msg: ${{ steps.version.outputs.msg }}
+      apk_ok: ${{ steps.apk.outputs.ok }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -49,6 +52,29 @@ jobs:
       - name: Build release APK
         run: ./gradlew assembleRelease --no-daemon --stacktrace
 
+      # 关键闸门：只有真的产出了合法 APK 才把 apk_ok 置为 true，
+      # release 任务据此决定是否发布（构建失败 / 产物缺失一律不发布）
+      - name: Verify APK
+        id: apk
+        run: |
+          set -e
+          APK_PATH=$(ls -1 app/build/outputs/apk/release/*.apk 2>/dev/null | head -n1 || true)
+          if [ -z "$APK_PATH" ]; then
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::error::构建产物中找不到 *.apk，已中止，不会创建 Release"
+            exit 1
+          fi
+          if [ ! -s "$APK_PATH" ]; then
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::error::$APK_PATH 为空文件，已中止，不会创建 Release"
+            exit 1
+          fi
+          # 必须是合法 zip，避免把半截文件 / 错误页面当成 APK 发出去
+          unzip -l "$APK_PATH" >/dev/null
+          ls -la "$APK_PATH"
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+          echo "path=$APK_PATH" >> "$GITHUB_OUTPUT"
+
       - name: Read version
         id: version
         run: |
@@ -66,23 +92,53 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "Version: code=$VC name=$VN tag=$TAG"
 
-      # 幂等：同一个 commit 重复跑（workflow_dispatch / 重跑）时先清掉旧的 tag 与 release
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: app-release
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+  # ── 2) 只有 build 成功且 apk_ok=true 时才会执行 ──────────────────────────
+  release:
+    needs: build
+    if: ${{ needs.build.outputs.apk_ok == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download APK artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: app-release
+          path: dist
+
+      - name: Verify downloaded APK
+        run: |
+          set -e
+          APK=$(ls -1 dist/*.apk 2>/dev/null | head -n1 || true)
+          test -n "$APK"
+          test -s "$APK"
+          unzip -l "$APK" >/dev/null
+          ls -la dist
+
+      # 幂等：同一个 commit 重复跑（workflow_dispatch / 重跑）时先清掉旧的 tag 与 release。
+      # 放在「产物校验通过之后」，避免构建失败却先把已有 Release 删掉。
       - name: Delete pre-existing tag & release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release delete "${{ steps.version.outputs.tag }}" --yes --cleanup-tag || true
+        run: gh release delete "${{ needs.build.outputs.tag }}" --repo "${{ github.repository }}" --yes --cleanup-tag || true
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          name: BlockDirs v${{ steps.version.outputs.vc }} (${{ steps.version.outputs.vn }})
-          files: app/build/outputs/apk/release/*.apk
+          tag_name: ${{ needs.build.outputs.tag }}
+          name: BlockDirs v${{ needs.build.outputs.vc }} (${{ needs.build.outputs.vn }})
+          files: dist/*.apk
           body: |
             阻止外置存储（OTG U 盘 / SD 卡）自动创建 Android、Music、Pictures、DCIM、Movies 等标准目录的 LSPosed 模块。
 
             ## 本次更新
-            ${{ steps.version.outputs.msg }}
+            ${{ needs.build.outputs.msg }}
 
             ## 使用说明
             1. 手机需已 Root 并安装支持 libxposed 新 API 的 LSPosed；
@@ -93,14 +149,14 @@ jobs:
           prerelease: false
           fail_on_unmatched_files: true
 
-  # 可选任务：把构建产物同步到 LSPosed 官方模块仓库（Xposed-Modules-Repo/<包名>）。
+  # ── 3) 可选：把已发布的产物同步到 LSPosed 官方模块仓库 ────────────────────
   # 默认跳过；配置好下面两项后才会执行，fork / 个人构建不会因此变红：
   #   仓库变量 MIRROR_REPO  = Xposed-Modules-Repo/top.yixiangren.blockdirs
   #   仓库密钥 MIRROR_TOKEN = 有该仓库写权限的 PAT
   publish-mirror:
-    runs-on: ubuntu-latest
-    needs: build
+    needs: [ build, release ]
     if: ${{ vars.MIRROR_REPO != '' }}
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v7
