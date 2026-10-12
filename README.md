@@ -21,7 +21,7 @@ Android 的 MediaProvider（`com.android.providers.media.module`，UID `10176`�
 | 目标进程 | 负责创建的目录 | 装的 Hook |
 |---|---|---|
 | `com.android.providers.media[.module]`（MediaProvider） | `Music` / `Pictures` / `DCIM` / `Movies` / `Downloads` … | native（主）+ Java 兜底 |
-| `android`（system_server） | `Android/`（`Android/data`、`Android/obb` 的副产物） | 仅 native |
+| `system`（system_server 的虚拟包名） | `Android/`（`Android/data`、`Android/obb` 的副产物） | 仅 native |
 
 两层拦截：
 
@@ -183,10 +183,14 @@ META-INF/xposed/scope.list
 2. 打开 LSPosed（需支持 libxposed 现代 API），启用模块。模块已内置作用域推荐（`scope.list`，会自动预选下面三项）：
    - **com.android.providers.media.module**（MediaProvider，媒体目录）
    - **com.android.providers.media**（旧版包名，部分机型）
-   - **系统框架**（`android`，用于 `Android/` 目录）
+   - **系统框架**（包名是 **`system`**，用于 `Android/` 目录）
 3. 重启手机（或重启 MediaProvider / 软重启使注入生效）。
 4. 插入 OTG U 盘 / SD 卡，观察其根目录不再自动生成媒体目录。
 
+> **别勾错**：LSPosed 里「系统框架」的包名是 `system`（libxposed 的虚拟包名，代表 system_server）；
+> 「Android 系统」的包名是 `android`（framework-res，uid 1000），它的组件跑在单独的 `:ui` 进程，
+> **勾 `android` 不会把模块注入 system_server**，`onSystemServerStarting` 也就不会被调用。
+>
 > libxposed 102 不再向 zygote 注入，作用域按进程精确投递。
 > 「系统框架」只装 native 层拦截，不会在 system_server 里全局 Hook `File.mkdir(s)`。
 >

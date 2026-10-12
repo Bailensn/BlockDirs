@@ -19,7 +19,7 @@ import top.yixiangren.blockdirs.hook.Targets
  * 1. `com.android.providers.media.module`（MediaProvider，UID 10176）
  *    媒体目录（Music / Pictures / DCIM / Movies / Downloads …）由它经 native 层 FUSE
  *    直接调用 libc 的 mkdir / mkdirat 创建 → [onPackageReady] 里装 native hook（+ Java 兜底）。
- * 2. `android`（system_server）
+ * 2. `system`（libxposed 代表 system_server 的虚拟包名，不是 `android`）
  *    卷挂载 / 准备用户存储的流程会创建 `Android/`（`Android/data`、`Android/obb` 的副产物）
  *    → [onSystemServerStarting] 里同样装 native hook。
  *
