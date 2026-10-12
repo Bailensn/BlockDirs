@@ -40,7 +40,7 @@ endif()
 # 手动 add_subdirectory shadowhook 的源码目录
 add_subdirectory(${shadowhook_SOURCE_DIR}/shadowhook/src/main/cpp shadowhook-build)
 
-# shadowhook 的 CMakeLists 用了 -Weverything -Werror，在 NDK 27 的 clang 下会触发
+# shadowhook 的 CMakeLists 用了 -Weverything -Werror，在较新 NDK 的 clang 下会触发
 # -Wunsafe-buffer-usage / -Wdeclaration-after-statement 等大量告警进而编译失败。
 # 这里追加 -Wno-error 关闭「告警即错误」。
 target_compile_options(shadowhook PRIVATE -Wno-error)

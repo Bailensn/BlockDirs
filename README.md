@@ -1,6 +1,10 @@
 # BlockDirs
 
-阻止手机在插入 OTG U 盘 / SD 卡等**外置可移动存储**时，自动在其根目录创建 `Android`、`Music`、`Pictures`、`DCIM`、`Movies` 等标准媒体目录的 LSPosed 模块。
+阻止手机在插入 OTG U 盘 / SD 卡等**外置可移动存储**时，自动在其根目录创建 `Android`、`Music`、`Pictures`、`DCIM`、`Movies` 等标准媒体目录的模块。
+
+- Xposed API：**libxposed API 102**（现代 Xposed API，`io.github.libxposed:api:102.0.0`）
+- 反射库：**KavaRef**（`com.highcapable.kavaref:*`，YukiHookAPI 1.3.0+ 官方反射引擎）
+- Hook 适配层：内置 `HookBridge` 抽象，已为 **YukiHook** 预留接入位（见下文）
 
 > 已在 ColorOS 16（Android 16，实测 `PJZ110` / ColorOS V16.1.0）上端到端验证通过；理论上基于 AOSP 的系统也可使用。
 
@@ -12,13 +16,20 @@ Android 的 MediaProvider（`com.android.providers.media.module`，UID `10176`�
 
 ## 原理
 
-本模块 Hook 位于 **MediaProvider 进程**内的 libc `mkdir` / `mkdirat` 符号（基于 ShadowHook 的 inline hook），采用**位置判定法**而非「黑名单目录名」：
+模块入口 `top.yixiangren.blockdirs.BlockDirsModule` 继承 `io.github.libxposed.api.XposedModule`，只在作用域目标进程（MediaProvider）中被框架实例化，然后安装两层拦截：
+
+1. **native 层（主拦截，ShadowHook inline hook）**
+   Hook 目标进程内 libc 的 `mkdir` / `mkdirat` 符号。
+2. **Java 层（兜底，libxposed Hook + KavaRef 反射）**
+   用 KavaRef 解析 `java.io.File#mkdir` / `#mkdirs`，命中同一判定规则时直接返回成功但不真正建目录。
+
+两层都采用**位置判定法**而非「黑名单目录名」：
 
 - 仅当目录路径满足以下条件时才拦截：
   - 路径前缀为 `/storage/`、`/mnt/media_rw/` 或 `/mnt/secure/`；
   - 且排除内部存储 `emulated`；
   - 且是「卷 UUID 之后仅一层」的目录名；
-- 命中后**返回 0（假装成功）但不真正创建目录**。
+- 命中后**返回成功（native 返回 0 / Java 返回 true）但不真正创建目录**。
 
 ### 设计要点
 
@@ -26,11 +37,67 @@ Android 的 MediaProvider（`com.android.providers.media.module`，UID `10176`�
 - **仅拦截外置可移动存储**：手机内部存储 `/storage/emulated` 完全不受影响。
 - **更深层子目录不受影响**：只拦卷根下的第一层，`XXX/Music/...` 这类子路径不拦。
 - **进程级隔离**：Hook 只安装在 MediaProvider 进程内，你用自己的文件管理器手动建目录走的是另一个进程，不会被拦。
-- **不会死循环**：`mkdir` 返回 0（成功）是终止信号，调用方收到「成功」不会重试，因此不会出现「反复创建」的现象。
+- **不会死循环**：返回「成功」是终止信号，调用方收到成功不会重试，因此不会出现「反复创建」的现象。
 
 ### 副作用（请知悉）
 
 - 外置卷根目录下任何**第一层目录**都会被拦截，包括你手动在卷根下新建的目录（但手动目录由文件管理器进程创建，实际不受影响，此条仅为 hook 语义说明）。
+
+---
+
+## 关于 YukiHookAPI
+
+本项目的 Hook 逻辑通过 `top.yixiangren.blockdirs.hook.HookBridge` 抽象，当前实现为 `LibxposedHookBridge`（官方 libxposed API 102），并为 YukiHook 预留了 `YukiHookBridge`。
+
+**目前无法直接使用 YukiHookAPI 的 libxposed 能力**，原因是：
+
+- YukiHookAPI 稳定版 **1.3.2** 基于旧版 rovo89 Xposed API（`de.robv.android.xposed:api:82`），属于传统模块，不是 libxposed 102；
+- 原生支持 libxposed 的 **2.x 分支**在仓库里只有占位空壳（`object YukiHook` 无实现），且**未发布到 Maven Central / JitPack / HighCapable 公共仓库**；
+- 官方 README 提到的 **1.5.0 公测版**（支持 libxposed）目前仅通过 Telegram 群发放，同样不在任何公开 Maven 仓库。
+
+因此当前先用官方 libxposed API 102 + KavaRef 落地；等 YukiHook 发布可用的 libxposed 依赖后，只需：
+1. 引入其 libxposed 支持模块（`kavaref-core` / `kavaref-android` 继续保留）；
+2. 在 `YukiHookBridge` 中按官方 DSL 复刻拦截逻辑；
+3. 把 `HookEngine.bridge` 从 `LibxposedHookBridge` 改为 `YukiHookBridge`。
+
+详细步骤见 [`YukiHookBridge.kt`](app/src/main/java/top/yixiangren/blockdirs/hook/YukiHookBridge.kt) 顶部注释。
+
+---
+
+## 目录结构
+
+```
+top.yixiangren.blockdirs/
+├── app/                                  # Android 应用（libxposed 入口 + 关于页 UI）
+│   └── src/main/
+│       ├── java/top/yixiangren/blockdirs/
+│       │   ├── BlockDirsModule.kt         # libxposed API 102 入口（XposedModule）
+│       │   ├── ActivationStatus.kt        # 激活状态检测（libxposed Service API）
+│       │   ├── MainActivity.java          # 关于页 UI
+│       │   ├── UpdateChecker.java         # 检查更新
+│       │   ├── hook/
+│       │   │   ├── HookBridge.kt          # Hook 适配层抽象（为 YukiHook 预留）
+│       │   │   ├── LibxposedHookBridge.kt # libxposed 102 实现（native + KavaRef 兜底）
+│       │   │   ├── YukiHookBridge.kt      # YukiHook 适配层占位
+│       │   │   ├── HookEngine.kt          # 桥接实现选择
+│       │   │   └── DirGuardPolicy.kt      # 「位置判定法」共享实现
+│       │   ├── nativebridge/
+│       │   │   └── BlockDirsNative.kt     # native 库加载与 JNI 声明
+│       │   └── com/bytedance/shadowhook/
+│       │       └── ShadowHook.kt          # shadowhook JNI_OnLoad 防御性空壳类
+│       ├── resources/META-INF/xposed/     # 现代 Xposed 模块元数据
+│       │   ├── module.prop                # minApiVersion/targetApiVersion=102
+│       │   ├── java_init.list             # 入口类声明
+│       │   └── scope.list                 # 推荐作用域
+│       └── res/layout/activity_main.xml
+├── native/                                # native hook 实现（ShadowHook + libc mkdir/mkdirat）
+│   ├── build.gradle.kts
+│   └── src/main/cpp/blockdirs.cpp
+├── app/build.gradle.kts                   # Kotlin DSL 构建脚本
+├── build.gradle.kts
+├── settings.gradle.kts
+└── ...
+```
 
 ---
 
@@ -47,37 +114,36 @@ Android 的 MediaProvider（`com.android.providers.media.module`，UID `10176`�
 # 产物：app/build/outputs/apk/release/app-release.apk
 ```
 
-环境：AGP 8.2.0、Gradle 8.6、JDK 17、NDK 27.2.12479018、CMake 4.0.2（native 以 CMake 构建）。
+> 若提示 `Permission denied`，先执行 `chmod +x gradlew`（部分文件系统 / 解压拷贝会丢失可执行位）。
+> 也可直接使用系统 Gradle：`gradle assembleRelease`。
+
+环境（全部为当前最新稳定版）：AGP 9.4.1、Gradle 9.8.1、JDK 21、Kotlin 2.4.21（AGP 9 内置 Kotlin，不再单独 apply `kotlin-android`）、
+compileSdk/targetSdk 36、NDK 30.0.16248370、CMake 4.1.2。构建脚本全部为 **Kotlin DSL**（`.gradle.kts`），模块代码全部为 **Kotlin**。
+
+> AGP 9 起 `android.newDsl` / `android.builtInKotlin` / `android.uniquePackageNames` 默认开启：
+> 无需再应用 `org.jetbrains.kotlin.android`，且每个 library 必须有独立 `namespace`（本项目的 `:native` 使用 `top.yixiangren.blockdirs.nativelib`）。
+
+构建产物 APK 根目录应包含：
+```
+META-INF/xposed/module.prop
+META-INF/xposed/java_init.list
+META-INF/xposed/scope.list
+```
 
 ---
 
 ## 安装与启用
 
 1. 安装构建出的 APK。
-2. 打开 LSPosed，勾选模块（模块已内置作用域推荐，会自动预选 MediaProvider），作用域选择：
-   - **系统框架**
+2. 打开 LSPosed（需支持 libxposed 现代 API），启用模块。模块已内置作用域推荐（`scope.list`，自动预选 MediaProvider），作用域选择：
    - **com.android.providers.media.module**（MediaProvider）
-3. 重启手机（或软重启使 zygote 注入生效）。
+   - **com.android.providers.media**（旧版包名，部分机型）
+3. 重启手机（或重启 MediaProvider / 软重启使注入生效）。
 4. 插入 OTG U 盘 / SD 卡，观察其根目录不再自动生成媒体目录。
 
+> libxposed 102 不再向 zygote 注入，作用域按进程精确投递；无需再勾选「系统框架」。
+>
 > 若之前安装过旧模块 `io.github.rootuser.no_otg_media_folders`，建议先卸载以避免混淆验证。
-
----
-
-## 目录结构
-
-```
-top.yixiangren.blockdirs/
-├── app/                 # Android 应用（LSPosed 入口 + 关于页 UI）
-│   └── src/main/
-│       ├── java/top/yixiangren/blockdirs/
-│       │   ├── MainHook.java      # Xposed 入口（zygote 加载 native + 注入 hook）
-│       │   └── MainActivity.java  # 关于页 UI
-│       └── res/layout/activity_main.xml
-├── native/              # native hook 实现（ShadowHook + libc mkdir/mkdirat）
-│   └── blockdirs.cpp
-└── ...
-```
 
 ---
 
