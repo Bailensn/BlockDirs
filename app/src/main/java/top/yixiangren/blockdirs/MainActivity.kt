@@ -132,13 +132,15 @@ class MainActivity : Activity() {
     }
 
     private fun bindLinks() {
-        val repoUrl = "https://github.com/yixiangdebufengren/top.yixiangren.blockdirs"
+        val repoUrl = AppInfo.REPO_URL
         val cards = intArrayOf(R.id.card_guide, R.id.card_github, R.id.card_blog)
         val urls = arrayOf("https://yixiangren.top/463187456", repoUrl, "https://yixiangren.top")
         for (i in cards.indices) {
             val url = urls[i]
             findViewById<View>(cards[i])?.setOnClickListener { openUrl(url) }
         }
+        // 仓库地址只在 AppInfo 一处维护，这里同步 Github 卡片的副标题
+        findViewById<TextView>(R.id.link_github_subtitle)?.text = AppInfo.REPO_SLUG
     }
 
     private fun bindUpdateCheck() {

@@ -38,9 +38,8 @@ class UpdateChecker private constructor() {
 
     companion object {
 
-        /** GitHub Releases 最新版 API */
-        private const val LATEST_API =
-            "https://api.github.com/repos/yixiangdebufengren/top.yixiangren.blockdirs/releases/latest"
+        /** GitHub Releases 最新版 API（仓库地址见 [AppInfo]） */
+        private const val LATEST_API = AppInfo.LATEST_RELEASE_API
 
         private const val PREFS = "update_check"
         private const val KEY_IGNORED = "ignored_version_code"
