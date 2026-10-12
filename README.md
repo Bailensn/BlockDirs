@@ -107,6 +107,22 @@ top.yixiangren.blockdirs/
 
 仓库已配置 `build.yml`，push 后会自动构建 `arm64-v8a` 的 Release APK（release 复用 debug 签名，便于覆盖安装）。
 
+构建产物会自动发布为 GitHub Release，tag 形如 `92-git+03d914ec`（= `git rev-list --count` + 短 hash），
+与 App 内「检查更新」的版本号约定一致。
+
+> **Fork 用户注意**：GitHub 会默认关闭 fork 仓库的 Actions。首次需要到 `Actions` 页面点一次
+> 「I understand my workflows, go ahead and enable them」，否则 push 后不会产生任何构建（运行记录恒为 0）。
+
+可选：把构建产物同步到 LSPosed 官方模块仓库（`Xposed-Modules-Repo/<包名>`）。默认**跳过**，
+配置好下面两项后才会启用（fork / 个人构建不会因此变红）：
+- 仓库**变量** `MIRROR_REPO`（Settings → Secrets and variables → Actions → Variables），例如 `Xposed-Modules-Repo/top.yixiangren.blockdirs`
+- 仓库**密钥** `MIRROR_TOKEN`（同页 Secrets），需为对该镜像仓库有写权限的 PAT
+
+工作流中的 Action 均为最新大版本，全部运行在 **node24** 运行时：
+`actions/checkout@v7`、`actions/setup-java@v6`、`android-actions/setup-android@v4`、
+`gradle/actions/setup-gradle@v6`、`softprops/action-gh-release@v3`。
+（若使用自托管 Runner，需 Runner 版本 ≥ 2.327.1。）
+
 ### 本地构建
 
 ```bash

@@ -8,17 +8,26 @@ on:
 permissions:
   contents: write
 
+# 同分支只允许一个构建在跑，避免并行创建同名 tag / release 互相打架
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      vc: ${{ steps.version.outputs.vc }}
+      vn: ${{ steps.version.outputs.vn }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: 'temurin'
           java-version: '21'
@@ -28,17 +37,17 @@ jobs:
         with:
           packages: ''
 
-      - name: Install platform and build-tools
+      - name: Install platform / build-tools / NDK / CMake
         run: |
           sdkmanager "platforms;android-36" "build-tools;36.0.0" "platform-tools" "ndk;30.0.16248370" "cmake;4.1.2"
 
+      # 不指定 gradle-version：直接用仓库里的 Gradle Wrapper，
+      # 版本只在 gradle/wrapper/gradle-wrapper.properties 一处维护
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          gradle-version: '9.8.1'
+        uses: gradle/actions/setup-gradle@v6
 
       - name: Build release APK
-        run: gradle assembleRelease --no-daemon
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
 
       - name: Read version
         id: version
@@ -57,16 +66,14 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "Version: code=$VC name=$VN tag=$TAG"
 
-      - name: Remove old tag & release
-        run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
-          if git rev-parse "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
-            git push origin :refs/tags/${{ steps.version.outputs.tag }} || true
-          fi
+      # 幂等：同一个 commit 重复跑（workflow_dispatch / 重跑）时先清掉旧的 tag 与 release
+      - name: Delete pre-existing tag & release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release delete "${{ steps.version.outputs.tag }}" --yes --cleanup-tag || true
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: BlockDirs v${{ steps.version.outputs.vc }} (${{ steps.version.outputs.vn }})
@@ -78,7 +85,7 @@ jobs:
             ${{ steps.version.outputs.msg }}
 
             ## 使用说明
-            1. 手机需已 Root 并安装 LSPosed；
+            1. 手机需已 Root 并安装支持 libxposed 新 API 的 LSPosed；
             2. 下载下方 app-release.apk 安装；
             3. 在 LSPosed 勾选 BlockDirs（模块已内置作用域推荐）；
             4. 重启手机后生效。
@@ -86,33 +93,30 @@ jobs:
           prerelease: false
           fail_on_unmatched_files: true
 
+  # 可选任务：把构建产物同步到 LSPosed 官方模块仓库（Xposed-Modules-Repo/<包名>）。
+  # 默认跳过；配置好下面两项后才会执行，fork / 个人构建不会因此变红：
+  #   仓库变量 MIRROR_REPO  = Xposed-Modules-Repo/top.yixiangren.blockdirs
+  #   仓库密钥 MIRROR_TOKEN = 有该仓库写权限的 PAT
   publish-mirror:
     runs-on: ubuntu-latest
     needs: build
+    if: ${{ vars.MIRROR_REPO != '' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - name: Read version
-        id: version
+      - name: Download APK from this repo's release
         run: |
-          VC=$(git rev-list --count HEAD)
-          VN="git+$(git rev-parse --short=8 HEAD)"
-          MSG=$(git log -1 --pretty=%B)
-          {
-            echo "tag=${VC}-${VN}"
-            echo "name=${VN}"
-            echo "msg<<EOF"
-            echo "$MSG"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Download APK from source release
-        run: |
-          TAG="${{ steps.version.outputs.tag }}"
-          curl -sL -o app-release.apk "https://github.com/yixiangdebufengren/top.yixiangren.blockdirs/releases/download/${TAG}/app-release.apk"
+          set -e
+          TAG="${{ needs.build.outputs.tag }}"
+          URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/app-release.apk"
+          echo "Downloading $URL"
+          curl -fsSL -o app-release.apk "$URL"
+          test -s app-release.apk
+          # 必须是合法 zip，避免把 404 页面之类的东西当成 APK 传上去
+          unzip -l app-release.apk >/dev/null
           ls -la app-release.apk
 
       - name: Publish release to LSPosed mirror repo
@@ -120,10 +124,10 @@ jobs:
           TOKEN: ${{ secrets.MIRROR_TOKEN }}
         run: |
           set -e
-          REPO="Xposed-Modules-Repo/top.yixiangren.blockdirs"
-          TAG="${{ steps.version.outputs.tag }}"
-          VER="BlockDirs v${{ steps.version.outputs.name }}"
-          MSG="${{ steps.version.outputs.msg }}"
+          REPO="${{ vars.MIRROR_REPO }}"
+          TAG="${{ needs.build.outputs.tag }}"
+          VER="BlockDirs v${{ needs.build.outputs.vn }}"
+          MSG="${{ needs.build.outputs.msg }}"
           BODY="阻止外置存储（OTG U 盘 / SD 卡）自动创建 Android、Music、Pictures、DCIM、Movies 等标准目录的 LSPosed 模块。\n\n本次更新：\n${MSG}"
           API="https://api.github.com/repos/$REPO"
 
@@ -139,7 +143,7 @@ jobs:
             curl -s -X DELETE -H "Authorization: token $TOKEN" "$API/git/refs/tags/$TAG" >/dev/null 2>&1 || true
           fi
 
-          # 3. 取 main 分支 sha 作为 tag 指向
+          # 3. 取镜像仓库 main 分支 sha 作为 tag 指向
           MAIN_SHA=$(curl -s -H "Authorization: token $TOKEN" "$API/git/refs/heads/main" | jq -r '.object.sha')
           test -n "$MAIN_SHA" && test "$MAIN_SHA" != "null"
 
