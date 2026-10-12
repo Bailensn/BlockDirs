@@ -15,7 +15,7 @@ package top.yixiangren.blockdirs.hook
  * - `/mnt/runtime/<access>/<UUID>/<name>`
  *
  * 排除：
- * - 内部共享存储：`/storage/emulated/...`、`/mnt/user/0/emulated/...`、`/mnt/runtime/*/emulated/...`
+ * - 内部共享存储：`/storage/emulated/...`、`/mnt/user/0/emulated/...`、`/mnt/runtime/<access>/emulated/...`
  * - 更深层路径：`<UUID>/<name>/...`
  * - 卷根本身：`/storage/<UUID>`
  *
