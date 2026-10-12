@@ -162,8 +162,12 @@ top.yixiangren.blockdirs/
 > 若提示 `Permission denied`，先执行 `chmod +x gradlew`（部分文件系统 / 解压拷贝会丢失可执行位）。
 > 也可直接使用系统 Gradle：`gradle assembleRelease`。
 
-环境（全部为当前最新稳定版）：AGP 9.4.1、Gradle 9.8.1、JDK 21、Kotlin 2.4.21（AGP 9 内置 Kotlin，不再单独 apply `kotlin-android`）、
-compileSdk/targetSdk 36、NDK 30.0.16248370、CMake 4.1.2。构建脚本全部为 **Kotlin DSL**（`.gradle.kts`），模块代码全部为 **Kotlin**。
+环境（除 NDK 外均为当前最新稳定版）：AGP 9.4.1、Gradle 9.8.1、JDK 21、Kotlin 2.4.21（AGP 9 内置 Kotlin，不再单独 apply `kotlin-android`）、
+compileSdk/targetSdk 36、NDK **27.2.12479018**、CMake 4.1.2。构建脚本全部为 **Kotlin DSL**（`.gradle.kts`），模块代码全部为 **Kotlin**。
+
+> **NDK 为什么不用最新**：shadowhook 的 `common/bytesig.h` 用了一套非常脆的变参宏
+> （`MACRO_CHOOSER` / `NO_ARG_EXPANDER`）实现崩溃信号保护，在 NDK 30（clang 21+）上会直接编译失败；
+> 上游最后一次提交是 2026-08，暂无修复。所以 native 侧固定在实测通过的 NDK 27。等上游适配后可再升。
 
 > AGP 9 起 `android.newDsl` / `android.builtInKotlin` / `android.uniquePackageNames` 默认开启：
 > 无需再应用 `org.jetbrains.kotlin.android`，且每个 library 必须有独立 `namespace`（本项目的 `:native` 使用 `top.yixiangren.blockdirs.nativelib`）。

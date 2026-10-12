@@ -42,7 +42,7 @@ jobs:
 
       - name: Install platform / build-tools / NDK / CMake
         run: |
-          sdkmanager "platforms;android-36" "build-tools;36.0.0" "platform-tools" "ndk;30.0.16248370" "cmake;4.1.2"
+          sdkmanager "platforms;android-36" "build-tools;36.0.0" "platform-tools" "ndk;27.2.12479018" "cmake;4.1.2"
 
       # 不指定 gradle-version：直接用仓库里的 Gradle Wrapper，
       # 版本只在 gradle/wrapper/gradle-wrapper.properties 一处维护
@@ -52,8 +52,9 @@ jobs:
       - name: Build release APK
         run: |
           set -o pipefail
-          # 同时落盘一份日志，失败时下面那步会把关键错误行贴出来
-          ./gradlew assembleRelease --no-daemon --stacktrace 2>&1 | tee build.log
+          # 同时落盘一份日志，失败时下面那步会把关键错误行贴出来。
+          # --no-build-cache：不让 Gradle 缓存还原 native 产物，避免拿到不一致的 .cxx/对象文件。
+          ./gradlew assembleRelease --no-daemon --no-build-cache --stacktrace 2>&1 | tee build.log
 
       # 失败时把真正报错的行写进 job summary，并以 annotation 形式发出去。
       # annotation 无需登录即可通过 REST API 读取（/check-runs/<id>/annotations），
@@ -61,10 +62,16 @@ jobs:
       - name: Dump build errors
         if: failure()
         run: |
+          # 剔除宏展开回溯与普通 warning，只留真正的报错，否则会被 note 淹没
+          ERR_LINES=$(grep -aEi 'error|fatal|FAILURE|Caused by|What went wrong|FAILED|Killed|No such file' build.log 2>/dev/null \
+            | grep -avE 'note: expanded from macro' \
+            | grep -avE '^C/C\+\+: *(warning|note):' \
+            | head -n 40 || true)
+
           {
             echo '## 构建失败：关键错误行'
             echo '```text'
-            grep -aE 'error:|e: |FAILURE:|What went wrong|Caused by:|> Task .* FAILED|fatal:|CMake Error' build.log 2>/dev/null | head -n 80 || true
+            echo "${ERR_LINES:-（没抓到 error 行，见下面的日志尾部）}"
             echo '```'
             echo '## 日志尾部'
             echo '```text'
@@ -80,7 +87,7 @@ jobs:
             echo "::error title=ci::${msg}"
             i=$((i + 1))
             if [ "$i" -ge 10 ]; then break; fi
-          done < <(grep -aE 'error:|e: |FAILURE:|What went wrong|Caused by:|> Task .* FAILED|CMake Error' build.log 2>/dev/null | head -n 10 || true)
+          done <<< "$(printf '%s\n' "$ERR_LINES" | head -n 10)"
           exit 0
 
       # 关键闸门：只有真的产出了合法 APK 才把 apk_ok 置为 true，
