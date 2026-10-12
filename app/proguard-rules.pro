@@ -1,7 +1,13 @@
 # BlockDirs R8 规则
 
-# Xposed 模块入口类保持（LSPosed 通过 meta-data 反射加载，类名不能被混淆）
+# Xposed 模块入口类与桥接层保持
+# （libxposed 框架通过 META-INF/xposed/java_init.list 反射实例化入口类，类名不能被混淆）
 -keep class top.yixiangren.blockdirs.** { *; }
+
+# 保持 libxposed 入口基类约定：任何继承 XposedModule 的入口都必须有公开无参构造
+-keep,allowoptimization public class * extends io.github.libxposed.api.XposedModule {
+    public <init>();
+}
 
 # 保持 Android 组件类（Activity / alias / receiver 等，manifest 声明不能被混淆）
 -keep class * extends android.app.Activity { *; }
@@ -15,6 +21,13 @@
 -keepclasseswithmembernames class * {
     native <methods>;
 }
+
+# libxposed API 的注解仅编译期存在（compileOnly），运行时无需解析
+-dontwarn io.github.libxposed.annotation.**
+
+# KavaRef 是编译期/运行期库，其反射目标是 JDK/Android 类，本身无需额外 keep
+-dontwarn com.highcapable.kavaref.**
+-dontwarn kotlin.**
 
 # appcompat / material 已在其 AAR 自带 keep 规则，无需额外处理
 # 保留注解（部分反射依赖）

@@ -2,6 +2,9 @@
 <resources>
     <string name="app_name">BlockDirs</string>
 
+    <!-- libxposed 现代 API：模块描述读取 application 的 android:description -->
+    <string name="app_description">阻止外置存储自动创建标准媒体目录</string>
+
     <!-- 大标题副文案 -->
     <string name="app_subtitle">阻止外置存储自动创建标准媒体目录</string>
 

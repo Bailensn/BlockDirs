@@ -80,7 +80,7 @@ static int my_mkdirat(int dirfd, const char *path, mode_t mode) {
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_top_yixiangren_blockdirs_MainHook_installNativeHook(JNIEnv *env, jclass clazz) {
+Java_top_yixiangren_blockdirs_nativebridge_BlockDirsNative_installNativeHook(JNIEnv *env, jclass clazz) {
     LOGI("installNativeHook: block ALL top-level dirs on external volumes");
 
     // 初始化 shadowhook（默认 inline 模式）
