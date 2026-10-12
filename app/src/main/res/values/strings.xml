@@ -8,8 +8,8 @@
     <!-- 大标题副文案 -->
     <string name="app_subtitle">阻止外置存储自动创建标准媒体目录</string>
 
-    <!-- 使用说明（已修正：无需勾选系统框架，无需重启） -->
-    <string name="usage_tip">在 LSPosed 中启用本模块，作用域勾选\n「com.android.providers.media」和\n「com.android.providers.media.module」即可。</string>
+    <!-- 使用说明：媒体目录在 MediaProvider，Android/ 目录在 system_server，两个都要勾 -->
+    <string name="usage_tip">在 LSPosed 中启用本模块，作用域勾选\n「com.android.providers.media(.module)」\n以及「系统框架」即可。</string>
 
     <!-- 版本号占位，运行时会用 versionName 替换 {version} -->
     <string name="version_footer">BlockDirs v{version} — LSPosed 模块</string>

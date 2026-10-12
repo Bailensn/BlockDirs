@@ -16,19 +16,31 @@ Android 的 MediaProvider（`com.android.providers.media.module`，UID `10176`�
 
 ## 原理
 
-模块入口 `top.yixiangren.blockdirs.BlockDirsModule` 继承 `io.github.libxposed.api.XposedModule`，只在作用域目标进程（MediaProvider）中被框架实例化，然后安装两层拦截：
+模块入口 `top.yixiangren.blockdirs.BlockDirsModule` 继承 `io.github.libxposed.api.XposedModule`，在**两个**作用域目标进程里分别安装拦截：
+
+| 目标进程 | 负责创建的目录 | 装的 Hook |
+|---|---|---|
+| `com.android.providers.media[.module]`（MediaProvider） | `Music` / `Pictures` / `DCIM` / `Movies` / `Downloads` … | native（主）+ Java 兜底 |
+| `android`（system_server） | `Android/`（`Android/data`、`Android/obb` 的副产物） | 仅 native |
+
+两层拦截：
 
 1. **native 层（主拦截，ShadowHook inline hook）**
-   Hook 目标进程内 libc 的 `mkdir` / `mkdirat` 符号。
-2. **Java 层（兜底，libxposed Hook + KavaRef 反射）**
+   Hook 目标进程内 libc 的 `mkdir` / `mkdirat`。
+2. **Java 层（兜底，libxposed Hook + KavaRef 反射，仅 MediaProvider）**
    用 KavaRef 解析 `java.io.File#mkdir` / `#mkdirs`，命中同一判定规则时直接返回成功但不真正建目录。
+   在 system_server 里不装这一层（全局 Hook `File.mkdir(s)` 影响面太大）。
 
 两层都采用**位置判定法**而非「黑名单目录名」：
 
-- 仅当目录路径满足以下条件时才拦截：
-  - 路径前缀为 `/storage/`、`/mnt/media_rw/` 或 `/mnt/secure/`；
-  - 且排除内部存储 `emulated`；
-  - 且是「卷 UUID 之后仅一层」的目录名；
+- 命中的路径形态（同一个卷在不同挂载命名空间下的多种写法）：
+  - `/storage/<UUID>/<name>`
+  - `/mnt/media_rw/<UUID>/<name>`
+  - `/mnt/secure/<...>/<name>`
+  - `/mnt/user/<userId>/<UUID>/<name>`
+  - `/mnt/runtime/<access>/<UUID>/<name>`
+- 排除：内部存储 `emulated`；卷根本身；`<UUID>/<name>/...` 这类更深层路径；
+- `mkdirat` 的相对路径（`dirfd` + 名字）会先经 `/proc/self/fd/<dirfd>` 还原成绝对路径再判定；
 - 命中后**返回成功（native 返回 0 / Java 返回 true）但不真正创建目录**。
 
 ### 设计要点
@@ -36,8 +48,17 @@ Android 的 MediaProvider（`com.android.providers.media.module`，UID `10176`�
 - **不硬编码目录名，零遗漏**：任何第一层目录都会被拦，不存在「漏掉某个标准目录名」的风险。
 - **仅拦截外置可移动存储**：手机内部存储 `/storage/emulated` 完全不受影响。
 - **更深层子目录不受影响**：只拦卷根下的第一层，`XXX/Music/...` 这类子路径不拦。
-- **进程级隔离**：Hook 只安装在 MediaProvider 进程内，你用自己的文件管理器手动建目录走的是另一个进程，不会被拦。
+- **进程级隔离**：Hook 只装在 MediaProvider 与 system_server 里，你用自己的文件管理器手动建目录走的是另一个进程，不会被拦。
 - **不会死循环**：返回「成功」是终止信号，调用方收到成功不会重试，因此不会出现「反复创建」的现象。
+
+### 已知限制（重要）
+
+- **`vold` / `installd` 创建的目录拦不到。** 这两个是 init 拉起的 **native 守护进程**，不是 Java 应用进程，Xposed / libxposed 注入不进去。如果某个目录（常见的就是 `Android/`）最终是它们建的，任何 Xposed 模块都无能为力 —— 需要从别的层面解决（magisk 模块 / 内核 / FUSE 层过滤）。
+- 想确认某个目录到底是谁建的，插卡时看日志：
+  ```bash
+  adb logcat -c && adb logcat | grep -i BlockDirs
+  ```
+  出现 `BLOCKED mkdir(at) ... /…/Android` 说明我们命中了；一条都没有说明它不在 MediaProvider / system_server 进程里。
 
 ### 副作用（请知悉）
 
@@ -159,13 +180,15 @@ META-INF/xposed/scope.list
 ## 安装与启用
 
 1. 安装构建出的 APK。
-2. 打开 LSPosed（需支持 libxposed 现代 API），启用模块。模块已内置作用域推荐（`scope.list`，自动预选 MediaProvider），作用域选择：
-   - **com.android.providers.media.module**（MediaProvider）
+2. 打开 LSPosed（需支持 libxposed 现代 API），启用模块。模块已内置作用域推荐（`scope.list`，会自动预选下面三项）：
+   - **com.android.providers.media.module**（MediaProvider，媒体目录）
    - **com.android.providers.media**（旧版包名，部分机型）
+   - **系统框架**（`android`，用于 `Android/` 目录）
 3. 重启手机（或重启 MediaProvider / 软重启使注入生效）。
 4. 插入 OTG U 盘 / SD 卡，观察其根目录不再自动生成媒体目录。
 
-> libxposed 102 不再向 zygote 注入，作用域按进程精确投递；无需再勾选「系统框架」。
+> libxposed 102 不再向 zygote 注入，作用域按进程精确投递。
+> 「系统框架」只装 native 层拦截，不会在 system_server 里全局 Hook `File.mkdir(s)`。
 >
 > 若之前安装过旧模块 `io.github.rootuser.no_otg_media_folders`，建议先卸载以避免混淆验证。
 

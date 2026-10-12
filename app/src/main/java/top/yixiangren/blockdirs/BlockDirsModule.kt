@@ -4,7 +4,9 @@ import android.util.Log
 import io.github.libxposed.api.XposedModule
 import io.github.libxposed.api.XposedModuleInterface.ModuleLoadedParam
 import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam
+import io.github.libxposed.api.XposedModuleInterface.SystemServerStartingParam
 import top.yixiangren.blockdirs.hook.HookEngine
+import top.yixiangren.blockdirs.hook.Targets
 
 /**
  * BlockDirs 的 libxposed API 102 入口。
@@ -12,9 +14,14 @@ import top.yixiangren.blockdirs.hook.HookEngine
  * 现代 Xposed API 不再向 zygote 注入，也不会把模块加载进模块自身进程：
  * 框架只会在【作用域内的目标进程】里实例化本类，并回调下面的生命周期方法。
  *
- * 目标进程：`com.android.providers.media.module`（MediaProvider，UID 10176）。
- * 该进程通过 native 层 FUSE 直接调用 libc 的 mkdir / mkdirat 创建外置卷根目录下的
- * 标准媒体目录，Java 层 Hook 拦不到，因此真正的拦截在 native 层完成。
+ * 目标进程有两个，因为「卷根第一层目录」不是同一个进程建的：
+ *
+ * 1. `com.android.providers.media.module`（MediaProvider，UID 10176）
+ *    媒体目录（Music / Pictures / DCIM / Movies / Downloads …）由它经 native 层 FUSE
+ *    直接调用 libc 的 mkdir / mkdirat 创建 → [onPackageReady] 里装 native hook（+ Java 兜底）。
+ * 2. `android`（system_server）
+ *    卷挂载 / 准备用户存储的流程会创建 `Android/`（`Android/data`、`Android/obb` 的副产物）
+ *    → [onSystemServerStarting] 里同样装 native hook。
  *
  * 入口声明：`META-INF/xposed/java_init.list`
  * 模块元数据：`META-INF/xposed/module.prop`、`META-INF/xposed/scope.list`
@@ -26,13 +33,12 @@ class BlockDirsModule : XposedModule() {
 
     /**
      * 模块代（generation）被加载进目标进程时回调，是最早的时机。
-     * 这里立刻按进程名判断并安装 native hook，避免在 MediaProvider 初始化
-     * 卷目录之前错过任何一次 mkdir。
+     * 这里立刻按进程名判断并安装 native hook，避免错过卷目录初始化的第一次 mkdir。
      */
     override fun onModuleLoaded(param: ModuleLoadedParam) {
         val processName = param.processName
         log(Log.INFO, TAG, "libxposed API ${getApiVersion()} loaded in $processName (systemServer=${param.isSystemServer})")
-        if (!isMediaProvider(processName)) return
+        if (!Targets.isMediaProvider(processName)) return
         HookEngine.bridge.install(this, processName, null)
     }
 
@@ -42,20 +48,20 @@ class BlockDirsModule : XposedModule() {
      */
     override fun onPackageReady(param: PackageReadyParam) {
         val packageName = param.packageName
-        if (!isMediaProvider(packageName)) return
+        if (!Targets.isMediaProvider(packageName)) return
         HookEngine.bridge.install(this, packageName, param.classLoader)
     }
 
+    /**
+     * system_server 就绪回调。
+     * 只装 native 层：`Android/` 目录通常在卷挂载阶段就被建出来了。
+     */
+    override fun onSystemServerStarting(param: SystemServerStartingParam) {
+        log(Log.INFO, TAG, "libxposed API ${getApiVersion()} loaded in system_server")
+        HookEngine.bridge.install(this, Targets.SYSTEM_SERVER, param.classLoader)
+    }
+
     companion object {
-
         const val TAG = "BlockDirs"
-
-        /** 各 ROM/Android 版本下 MediaProvider 的两种包名 */
-        private val MEDIA_PROVIDER_PACKAGES = setOf(
-            "com.android.providers.media.module",
-            "com.android.providers.media"
-        )
-
-        fun isMediaProvider(name: String): Boolean = name in MEDIA_PROVIDER_PACKAGES
     }
 }

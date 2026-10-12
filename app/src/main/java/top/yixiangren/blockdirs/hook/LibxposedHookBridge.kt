@@ -17,11 +17,12 @@ import java.lang.reflect.Method
  *    libc 的 `mkdir` / `mkdirat`。MediaProvider 走的就是 FUSE -> libc 这条路径，
  *    这是唯一可靠、零遗漏的拦截点。
  *
- * 2. **Java 层（兜底）**：用 KavaRef 反射解析 `java.io.File#mkdir` / `#mkdirs` 并用
- *    libxposed 挂 Hook，命中同一套「位置判定法」时直接返回成功但不真正建目录。
+ * 2. **Java 层（兜底，仅 MediaProvider）**：用 KavaRef 反射解析 `java.io.File#mkdir` / `#mkdirs`
+ *    并用 libxposed 挂 Hook，命中同一套「位置判定法」时直接返回成功但不真正建目录。
  *    部分 ROM 的 MediaProvider 也会走 Java 层建目录，这一层用来补齐。
+ *    在 system_server 里**不装**这一层：全局 Hook `File.mkdir(s)` 影响面太大。
  *
- * 所有 Hook 都只安装在目标进程（MediaProvider）内，不影响其它进程。
+ * 所有 Hook 都只安装在目标进程内，不影响其它进程。
  */
 object LibxposedHookBridge : HookBridge {
 
@@ -39,7 +40,8 @@ object LibxposedHookBridge : HookBridge {
 
     override fun install(module: XposedModule, target: String, classLoader: ClassLoader?) {
         installNativeHook(module, target)
-        installJavaGuard(module, target)
+        // Java 层兜底只在 MediaProvider 里装
+        if (Targets.isMediaProvider(target)) installJavaGuard(module, target)
     }
 
     /** native 层：libc mkdir / mkdirat（幂等） */
@@ -92,7 +94,8 @@ object LibxposedHookBridge : HookBridge {
             .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
             .setId("blockdirs-file-$methodName")
             .intercept { chain ->
-                val path = (chain.thisObject as? File)?.path
+                // absolutePath：File 也可能是相对路径，用绝对路径才能和 native 侧判定对齐
+                val path = (chain.thisObject as? File)?.absolutePath
                 if (DirGuardPolicy.isTopLevelOnExternal(path)) {
                     module.log(Log.WARN, TAG, "[$id] blocked File.$methodName -> $path")
                     // mkdir / mkdirs 返回 boolean：返回 true 假装成功，调用方收到成功即停止重试
