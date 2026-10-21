@@ -178,7 +178,7 @@ top.yixiangren.blockdirs/
 > 也可直接使用系统 Gradle：`gradle assembleRelease`。
 
 环境（全部为当前最新稳定版）：AGP 9.4.1、Gradle 9.8.1、JDK 21、Kotlin 2.4.21（AGP 9 内置 Kotlin，不再单独 apply `kotlin-android`）、
-KSP 2.3.12（YukiHook 代码生成）、compileSdk/targetSdk 36、NDK 30.0.16248370、CMake 4.1.2。
+KSP 2.3.12（YukiHook 代码生成）、compileSdk 37 / targetSdk 36、NDK 30.0.16248370、CMake 4.1.2。
 构建脚本全部为 **Kotlin DSL**（`.gradle.kts`），模块代码全部为 **Kotlin**。
 
 > 构建时会由 KSP 生成 `HookEntry_YukiHookXposedInit` 与 `META-INF/xposed/{java_init.list,module.prop,scope.list}`，

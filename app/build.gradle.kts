@@ -21,7 +21,10 @@ val yukihookVersion = "1.5.0"
 
 android {
     namespace = "top.yixiangren.blockdirs"
-    compileSdk = 36
+    // YukiHook 1.5.0 的 AAR 元数据声明 minCompileSdk=37 / minCompileMinorSdk=0，
+    // compileSdk 低于 37 会在 checkReleaseAarMetadata 阶段直接失败。
+    // 对应 SDK 包是 platforms;android-37.0（API 37.0，Android 现在按 37.x 小版本发布）。
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "top.yixiangren.blockdirs"

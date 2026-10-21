@@ -42,7 +42,7 @@ jobs:
 
       - name: Install platform / build-tools / NDK / CMake
         run: |
-          sdkmanager "platforms;android-36" "build-tools;36.0.0" "platform-tools" "ndk;30.0.16248370" "cmake;4.1.2"
+          sdkmanager "platforms;android-37.0" "build-tools;36.0.0" "build-tools;37.0.0" "platform-tools" "ndk;30.0.16248370" "cmake;4.1.2"
 
       # 不指定 gradle-version：直接用仓库里的 Gradle Wrapper，
       # 版本只在 gradle/wrapper/gradle-wrapper.properties 一处维护
@@ -61,20 +61,27 @@ jobs:
       - name: Dump build errors
         if: failure()
         run: |
+          # Gradle 的 "* What went wrong:" 到 "* Try:" 之间是完整原因（含多行明细，
+          # 比如 AAR metadata 的 1./2./3. 条），这些明细行不含 error 关键字，
+          # 只按关键字 grep 会全部丢掉 —— 所以单独整段抓出来
+          DETAIL=$(awk '/^\* What went wrong:/{f=1;next} f&&/^\* Try:/{exit} f{print}' build.log 2>/dev/null | head -n 14 || true)
+
           # 剔除噪声：宏展开回溯、普通 warning、以及 C/C++ 源码上下文行
-          # （后者形如 "C/C++:   476 | ..."，经常因为源码里出现 "error," 字样被误抓，
-          #  上一轮就把真正的 Kotlin 报错挤到后面去了）
-          ERR_LINES=$(grep -aEi 'error|fatal|FAILURE|Caused by|What went wrong|FAILED|Killed' build.log 2>/dev/null \
+          ERR_LINES=$(grep -aEi 'error|fatal|FAILURE|FAILED|Killed' build.log 2>/dev/null \
             | grep -avE 'note: expanded from macro' \
             | grep -avE '^C/C\+\+: *(warning|note):' \
             | grep -avE '^C/C\+\+: *[0-9]+ *\|' \
             | head -n 40 || true)
-          # Kotlin / Gradle 自身的报错、以及依赖解析的根因（Caused by / Could not ...）优先排在前面
+          # Kotlin / Gradle 自身的报错、依赖解析根因优先
           PRIORITY=$(printf '%s\n' "$ERR_LINES" | grep -aE '^e: file:|^> Task .* FAILED|What went wrong|FAILURE:|Caused by:|Could not resolve|Could not find|no version specified' || true)
-          ORDERED=$(printf '%s\n%s\n' "$PRIORITY" "$ERR_LINES" | awk 'NF && !seen[$0]++')
+          ORDERED=$(printf '%s\n%s\n%s\n' "$DETAIL" "$PRIORITY" "$ERR_LINES" | awk 'NF && !seen[$0]++')
 
           {
-            echo '## 构建失败：关键错误行'
+            echo '## 构建失败：Gradle 原因（What went wrong）'
+            echo '```text'
+            echo "${DETAIL:-（没有 What went wrong 段）}"
+            echo '```'
+            echo '## 关键错误行'
             echo '```text'
             echo "${ORDERED:-（没抓到 error 行，见下面的日志尾部）}"
             echo '```'
