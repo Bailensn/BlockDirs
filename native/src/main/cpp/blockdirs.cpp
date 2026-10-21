@@ -203,11 +203,20 @@ static const char *resolve_mkdirat_path(int dirfd, const char *path, char *out, 
 
 // Hook 后的 mkdir
 //
-// 两条 ShadowHook 的硬性要求（同步自上游 0dd79e6a，他们后来 revert 时误删了）：
-//  1) 必须调用 SHADOWHOOK_STACK_SCOPE()（C++ RAII，函数退出时自动 pop_stack）。
-//     否则 shadowhook 的 hub 会认为上一次代理调用「还在递归中」，
-//     从第二次调用起就不再回调本代理函数 —— 表现为「hook 只生效一次」。
-//  2) 调用原函数必须用 SHADOWHOOK_CALL_PREV 宏，不能直接调裸函数指针。
+// ⚠️ 踩过的坑，别再改回去：
+//
+// 1) 必须调用 SHADOWHOOK_STACK_SCOPE()（C++ RAII，函数退出时 pop_stack）。
+//    shadowhook 的每个线程有一个定长 frame 栈，进代理前 push、出代理后 pop；
+//    少了这行 pop，栈会被占满，之后 hub 直接绕过 hook —— 表现为「hook 只生效一次」。
+//    （这条修同步自上游 0dd79e6a，他们后来 revert 时误删了。）
+//
+// 2) **绝对不要用 SHADOWHOOK_CALL_PREV 调原函数**，直接用 hook 时回填的 orig 指针。
+//    CALL_PREV 会走 shadowhook_get_prev_func()，而它在 pinned commit 593f491b 里的实现是：
+//        sh_hub_stack_t *stack = sh_safe_pthread_getspecific(sh_hub_stack_tls_key);
+//        if (0 == stack->frames_cnt) sh_safe_abort();
+//    TLS 里的 stack 在某些进程/线程上拿不到（已实测：MediaProvider 的 android.bg 线程），
+//    于是 stack == NULL → 解引用 0x0 → SIGSEGV。我们就是这样把 MediaProvider 打崩、
+//    FUSE 守护进程跟着死、内部存储都挂载不上的。orig 指针没有这个依赖。
 /** 记一次拦截；返回 true 表示已熔断、调用方应当放行 */
 static bool burst_guard_should_pass() {
     timespec ts{};
@@ -263,7 +272,7 @@ static int my_mkdir(const char *path, mode_t mode) {
     if (handle_top_level_mkdir("mkdir", path, &result)) {
         return result;
     }
-    return SHADOWHOOK_CALL_PREV(my_mkdir, path, mode);
+    return orig_mkdir(path, mode);
 }
 
 // Hook 后的 mkdirat
@@ -280,7 +289,7 @@ static int my_mkdirat(int dirfd, const char *path, mode_t mode) {
             return result;
         }
     }
-    return SHADOWHOOK_CALL_PREV(my_mkdirat, dirfd, path, mode);
+    return orig_mkdirat(dirfd, path, mode);
 }
 
 /** 初始化 shadowhook（只做一次；热重载时不重复初始化） */
