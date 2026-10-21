@@ -23,6 +23,14 @@
 static int (*orig_mkdir)(const char *, mode_t) = nullptr;
 static int (*orig_mkdirat)(int, const char *, mode_t) = nullptr;
 
+// shadowhook 返回的 stub（进程级共享）。
+// 热重载只会替换 Java 类加载器，libxposed 不会 dlclose 模块的 .so、也不会调 JNI_OnUnload，
+// 所以这里的静态状态在同一个进程里跨「模块世代」依然有效：新一代实例再次调用
+// installNativeHook 会被下面的守卫挡住，不会重复 hook。
+static void *mkdir_stub = nullptr;
+static void *mkdirat_stub = nullptr;
+static bool shadowhook_ready = false;
+
 // 判断路径是否是「外置卷根目录下的第一层目录」。
 //
 // 与 Kotlin 侧 DirGuardPolicy.isTopLevelOnExternal 保持一致，改一处必须同步另一处。
@@ -140,48 +148,73 @@ static bool is_top_level_on_external_at(int dirfd, const char *path) {
 }
 
 // Hook 后的 mkdir
+//
+// 两条 ShadowHook 的硬性要求（同步自上游 0dd79e6a，他们后来 revert 时误删了）：
+//  1) 必须调用 SHADOWHOOK_STACK_SCOPE()（C++ RAII，函数退出时自动 pop_stack）。
+//     否则 shadowhook 的 hub 会认为上一次代理调用「还在递归中」，
+//     从第二次调用起就不再回调本代理函数 —— 表现为「hook 只生效一次」。
+//  2) 调用原函数必须用 SHADOWHOOK_CALL_PREV 宏，不能直接调裸函数指针。
 static int my_mkdir(const char *path, mode_t mode) {
+    SHADOWHOOK_STACK_SCOPE();
+
     if (is_top_level_on_external(path)) {
         LOGW("BLOCKED mkdir (top-level on external volume): %s", path);
         return 0;
     }
-    return orig_mkdir(path, mode);
+    return SHADOWHOOK_CALL_PREV(my_mkdir, path, mode);
 }
 
 // Hook 后的 mkdirat
 static int my_mkdirat(int dirfd, const char *path, mode_t mode) {
+    SHADOWHOOK_STACK_SCOPE();
+
     if (is_top_level_on_external_at(dirfd, path)) {
         LOGW("BLOCKED mkdirat (top-level on external volume): dirfd=%d path=%s", dirfd, path);
         return 0;
     }
-    return orig_mkdirat(dirfd, path, mode);
+    return SHADOWHOOK_CALL_PREV(my_mkdirat, dirfd, path, mode);
+}
+
+/** 初始化 shadowhook（只做一次；热重载时不重复初始化） */
+static bool ensure_shadowhook() {
+    if (shadowhook_ready) return true;
+    if (shadowhook_init(SHADOWHOOK_MODE_UNIQUE, false) != 0) {
+        LOGE("shadowhook_init failed, errno=%d", shadowhook_get_errno());
+        return false;
+    }
+    shadowhook_ready = true;
+    return true;
+}
+
+/** 同一个符号已经被 hook 过（上一代实例留下的，或别的模块先 hook 了） */
+static bool is_duplicate_hook_error() {
+    int err = shadowhook_get_errno();
+    return err == SHADOWHOOK_ERRNO_HOOK_UNIQUE_DUP || err == SHADOWHOOK_ERRNO_HOOK_DUP;
+}
+
+/** hook 一个 libc 符号；已 hook / 重复时跳过而不报错（幂等，供热重载复用） */
+static void hook_libc_symbol(const char *sym, void *new_addr, void **orig_addr, void **stub_out) {
+    if (*stub_out != nullptr) return;
+
+    void *stub = shadowhook_hook_sym_name("libc.so", sym, new_addr, orig_addr);
+    if (stub != nullptr) {
+        *stub_out = stub;
+        LOGI("%s hooked, orig=%p", sym, *orig_addr);
+        return;
+    }
+    if (is_duplicate_hook_error()) {
+        LOGW("%s 已被 hook 过（上一代实例或其它模块），跳过", sym);
+        return;
+    }
+    LOGE("%s hook failed, errno=%d", sym, shadowhook_get_errno());
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_top_yixiangren_blockdirs_nativebridge_BlockDirsNative_installNativeHook(JNIEnv *env, jclass clazz) {
     LOGI("installNativeHook: block ALL top-level dirs on external volumes");
 
-    // 初始化 shadowhook（默认 inline 模式）
-    if (shadowhook_init(SHADOWHOOK_MODE_UNIQUE, false) != 0) {
-        LOGE("shadowhook_init failed");
-        return;
-    }
+    if (!ensure_shadowhook()) return;
 
-    // Hook libc 的 mkdir
-    void *mkdir_stub = shadowhook_hook_sym_name(
-            "libc.so", "mkdir", (void *) my_mkdir, (void **) &orig_mkdir);
-    if (mkdir_stub != nullptr) {
-        LOGI("mkdir hooked, orig=%p", (void *) orig_mkdir);
-    } else {
-        LOGE("mkdir hook failed");
-    }
-
-    // Hook libc 的 mkdirat
-    void *mkdirat_stub = shadowhook_hook_sym_name(
-            "libc.so", "mkdirat", (void *) my_mkdirat, (void **) &orig_mkdirat);
-    if (mkdirat_stub != nullptr) {
-        LOGI("mkdirat hooked, orig=%p", (void *) orig_mkdirat);
-    } else {
-        LOGE("mkdirat hook failed");
-    }
+    hook_libc_symbol("mkdir", (void *) my_mkdir, (void **) &orig_mkdir, &mkdir_stub);
+    hook_libc_symbol("mkdirat", (void *) my_mkdirat, (void **) &orig_mkdirat, &mkdirat_stub);
 }
