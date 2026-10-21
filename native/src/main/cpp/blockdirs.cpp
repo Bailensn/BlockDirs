@@ -217,7 +217,7 @@ Java_top_yixiangren_blockdirs_nativebridge_BlockDirsNative_selfTest(
     }
 
     // volatile 函数指针：阻止编译器内联/常量折叠，保证真的走一次调用
-    volatile int (*fn)(int) = blockdirs_self_test_target;
+    int (*volatile fn)(int) = blockdirs_self_test_target;   // volatile 指针：强制每次真调用
     int value = fn(21);
     int calls = g_self_test_calls.load(std::memory_order_relaxed);
     if (value == 43 && calls == 1) {

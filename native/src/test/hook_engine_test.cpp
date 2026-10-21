@@ -43,7 +43,10 @@ extern "C" __attribute__((noinline, used)) int test_proxy(int a) {
 
 int main() {
     // 用 volatile 函数指针，阻止编译器内联/常量折叠，保证真的走一次调用
-    volatile int (*fp)(int) = test_target;
+    // 注意写法：volatile 修饰的是「指针本身」(int (*volatile)(int))，
+    // 保证每次调用都从内存重新加载指针，编译器就无法把它当成 test_target 常量去做内联/折叠。
+    // 写成 volatile int (*)(int) 是「指向返回 volatile 的函数的指针」，编译期会直接报错。
+    int (*volatile fp)(int) = test_target;
 
     // 0) 基线
     CHECK(fp(21) == 42, "基线返回值错误: %d", fp(21));
