@@ -186,6 +186,27 @@ top.yixiangren.blockdirs/
 `gradle/actions/setup-gradle@v6`、`softprops/action-gh-release@v3`。
 （若使用自托管 Runner，需 Runner 版本 ≥ 2.327.1。）
 
+## 测试（四层，从便宜到贴近真机）
+
+| 层 | 在哪跑 | 覆盖什么 |
+|---|---|---|
+| 1. JVM 单测 | CI `build` job（`./gradlew testDebugUnitTest`） | `DirGuardPolicy` 路径判定（挡外部卷第一层、放过 emulated / 卷根 / 更深层 / 无关路径） |
+| 2. native 单测 | CI `test-native` job（aarch64 交叉编译 + qemu 真跑） | 跳板 ±128MB、`b` 编码、代理调用、连续 100 次、重复安装、`guard_policy` 与 `resolve_mkdirat_path` |
+| 3. APK 结构检查 | CI `build` job（`Verify APK`） | `META-INF/xposed/*` 存在、`minApiVersion`/`targetApiVersion=102`、入口类名、作用域含 MediaProvider、`libblockdirs.so` 已打包 |
+| 4. 设备自检 | **你的手机**，App 启动时自动跑 | 在真机进程里给本 .so 的假函数装 hook：mmap 跳板 → 改入口 → 跳进代理 → 返回值正确 |
+
+第 4 层怎么看结果：
+
+```bash
+adb logcat -s BlockDirs | grep "native self-test"
+# OK: target=0x... stub=0x... delta=...      → 这台机器上 hook 引擎可用
+# FAIL(install): ... / FAIL(call): ...        → 不能用，native 层必须保持关闭
+# SKIP: native 库未加载                        → 只是没装进这个进程，不代表失败
+```
+
+> 第 4 层通过 ≠ MediaProvider 里一定生效（两个进程的映射布局/时机不同），
+> 但它失败就一定不能开 native 层。所以开启顺序永远是：CI 全绿 → 设备自检 OK → 先 log-only 跑一轮 → 再开真拦截。
+
 ### native 层单测（CI 自动跑，不碰真机）
 
 `hook_engine`（mmap 跳板 + 改入口 4 字节）是纯 POSIX 代码，抽在

@@ -17,7 +17,8 @@ set(CMAKE_CXX_STANDARD 17)
 
 add_library(blockdirs SHARED
     blockdirs.cpp
-    hook_engine.cpp)
+    hook_engine.cpp
+    guard_policy.cpp)
 
 # hook_engine 是纯 POSIX 的（不依赖 Android），CI 会用 aarch64 交叉编译器 + qemu 对它
 # 跑真执行单测（native/src/test/hook_engine_test.cpp），所以别往里加 Android 头文件。

@@ -49,6 +49,12 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
 
+      - name: Run unit tests
+        run: |
+          set -o pipefail
+          # DirGuardPolicy 的路径判定（JVM 单测，和 native 侧同一张用例表）
+          ./gradlew testDebugUnitTest --no-daemon --stacktrace 2>&1 | tee unit-test.log
+
       - name: Build release APK
         run: |
           set -o pipefail
@@ -122,6 +128,35 @@ jobs:
           # 必须是合法 zip，避免把半截文件 / 错误页面当成 APK 发出去
           unzip -l "$APK_PATH" >/dev/null
           ls -la "$APK_PATH"
+
+          echo "── Xposed 元数据（KSP 生成的）──"
+          for f in META-INF/xposed/module.prop META-INF/xposed/java_init.list META-INF/xposed/scope.list; do
+            if ! unzip -l "$APK_PATH" | grep -q " $f$"; then
+              echo "ok=false" >> "$GITHUB_OUTPUT"
+              echo "::error::$APK_PATH 缺少 $f（KSP 没生成或没打进 APK）"
+              exit 1
+            fi
+            echo "[ok] $f"
+          done
+          unzip -p "$APK_PATH" META-INF/xposed/module.prop | tee /tmp/module.prop
+          grep -q '^minApiVersion=102$' /tmp/module.prop || { echo "::error::module.prop 少了 minApiVersion=102"; exit 1; }
+          grep -q '^targetApiVersion=102$' /tmp/module.prop || { echo "::error::module.prop 少了 targetApiVersion=102"; exit 1; }
+          echo "[ok] module.prop 版本声明正确"
+
+          echo "── 入口类与作用域 ──"
+          unzip -p "$APK_PATH" META-INF/xposed/java_init.list | tee /tmp/java_init.list
+          grep -q 'HookEntry_YukiHookXposedInit' /tmp/java_init.list || { echo "::error::java_init.list 里没有生成的入口类"; exit 1; }
+          unzip -p "$APK_PATH" META-INF/xposed/scope.list | tee /tmp/scope.list
+          grep -q 'com.android.providers.media.module' /tmp/scope.list || { echo "::error::scope.list 缺 MediaProvider"; exit 1; }
+          echo "[ok] 入口类与作用域"
+
+          echo "── native 库 ──"
+          if ! unzip -l "$APK_PATH" | grep -q 'lib/arm64-v8a/libblockdirs.so'; then
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::error::$APK_PATH 缺少 lib/arm64-v8a/libblockdirs.so"
+            exit 1
+          fi
+          echo "[ok] libblockdirs.so 已打包"
           echo "ok=true" >> "$GITHUB_OUTPUT"
           echo "path=$APK_PATH" >> "$GITHUB_OUTPUT"
 
@@ -168,12 +203,19 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             g++-aarch64-linux-gnu qemu-user-static
 
-      - name: Build and run arm64 hook engine test (qemu user mode)
+      - name: Prepare policy test fixture
+        run: |
+          # guard_policy 里有「第一层目录已存在 / 不存在」两条分支，需要真实目录才能都测到
+          sudo mkdir -p /storage/1234-ABCD/Music
+          ls -ld /storage/1234-ABCD/Music
+
+      - name: Build and run arm64 native test (qemu user mode)
         run: |
           set -o pipefail
           aarch64-linux-gnu-g++ -std=c++17 -O1 -static -mbranch-protection=standard \
             -Inative/src/main/cpp \
             native/src/main/cpp/hook_engine.cpp \
+            native/src/main/cpp/guard_policy.cpp \
             native/src/test/hook_engine_test.cpp \
             -o hook_engine_test 2>&1 | tee native-test-build.log
           qemu-aarch64-static ./hook_engine_test

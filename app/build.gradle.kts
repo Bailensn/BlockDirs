@@ -95,6 +95,9 @@ dependencies {
     implementation("com.highcapable.kavaref:kavaref-android")
     implementation("com.highcapable.kavaref:kavaref-extension")
 
+    // JVM 单测（DirGuardPolicy 的路径判定）
+    testImplementation("junit:junit:4.13.2")
+
     implementation(project(":native"))
     implementation("androidx.appcompat:appcompat:1.8.0")
     implementation("com.google.android.material:material:1.14.0")

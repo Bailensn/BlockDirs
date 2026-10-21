@@ -47,6 +47,7 @@
 #include <android/log.h>
 
 #include "hook_engine.h"
+#include "guard_policy.h"
 
 #define TAG "BlockDirsNative"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -70,160 +71,6 @@ static std::atomic<bool> burst_tripped{false};
 
 // 已安装标记（进程级；热重载只换 Java 类加载器，.so 不会被 dlclose）
 static std::atomic<bool> hooks_installed{false};
-
-// ============================================================================
-// 策略：判断路径是否是「外置卷根目录下的第一层目录」
-//
-// 与 Kotlin 侧 DirGuardPolicy.isTopLevelOnExternal 保持一致，改一处必须同步另一处。
-//
-// 支持的路径形态（同一个卷在不同挂载命名空间下的多种写法）：
-//   /storage/<UUID>/<name>
-//   /mnt/media_rw/<UUID>/<name>
-//   /mnt/secure/<...>/<name>
-//   /mnt/user/<userId>/<UUID>/<name>
-//   /mnt/runtime/<access>/<UUID>/<name>
-// 排除：内部存储 emulated、卷根本身。
-// ============================================================================
-
-/**
- * 判断「卷根 + 第一层目录名」这一层是否还不存在。
- *
- * @param norm 已经去掉尾部 '/' 的绝对路径
- * @param name 第一层目录名开始的位置（可能还带着更深的 "/xxx" 尾巴）
- */
-static bool is_first_level_missing(const char *norm, const char *name) {
-    const char *deeper = strchr(name, '/');       // 调用方保证非空
-    size_t prefix_len = (size_t) (name - norm);   // 含卷根末尾的 '/'
-    size_t name_len = (size_t) (deeper - name);
-
-    char first_level[BLOCKDIRS_MAX_PATH];
-    if (prefix_len + name_len >= sizeof(first_level)) {
-        return false;
-    }
-    memcpy(first_level, norm, prefix_len + name_len);
-    first_level[prefix_len + name_len] = '\0';
-
-    struct stat st{};
-    return stat(first_level, &st) != 0;   // 父层不在 -> 子路径也拦
-}
-
-static bool is_top_level_on_external(const char *path) {
-    if (path == nullptr || *path == '\0') {
-        return false;
-    }
-
-    // 去掉尾部 '/'（mkdir("/a/b/") 与 mkdir("/a/b") 语义相同）
-    char norm[BLOCKDIRS_MAX_PATH];
-    size_t len = strlen(path);
-    if (len >= sizeof(norm)) {
-        return false;
-    }
-    memcpy(norm, path, len + 1);
-    while (len > 1 && norm[len - 1] == '/') {
-        norm[--len] = '\0';
-    }
-
-    const char *base = nullptr;
-
-    if (strncmp(norm, "/storage/", 9) == 0) {
-        base = norm + 9;
-    } else if (strncmp(norm, "/mnt/media_rw/", 14) == 0) {
-        base = norm + 14;
-    } else if (strncmp(norm, "/mnt/secure/", 12) == 0) {
-        base = norm + 12;
-    } else if (strncmp(norm, "/mnt/user/", 10) == 0) {
-        // /mnt/user/<userId>/<UUID>/<name> —— 跳过 userId 这一层
-        const char *sep = strchr(norm + 10, '/');
-        if (sep == nullptr) {
-            return false;
-        }
-        base = sep + 1;
-    } else if (strncmp(norm, "/mnt/runtime/", 13) == 0) {
-        // /mnt/runtime/<access>/<UUID>/<name> —— 跳过 access 这一层
-        const char *sep = strchr(norm + 13, '/');
-        if (sep == nullptr) {
-            return false;
-        }
-        base = sep + 1;
-    } else {
-        return false;
-    }
-
-    // 排除内部共享存储 /storage/emulated/... 等
-    if (strncmp(base, "emulated", 8) == 0) {
-        return false;
-    }
-
-    // 找到卷 UUID 后的第一个 '/'，后面是第一层目录名
-    const char *slash = strchr(base, '/');
-    if (slash == nullptr) {
-        return false;
-    }
-
-    const char *name = slash + 1;
-    if (*name == '\0') {
-        return false;
-    }
-
-    // 第一层目录不存在时，它下面的子路径也一并拦。
-    //
-    // 原因：父目录被我们拦掉（返回成功但没建），紧接着的 mkdir("<卷根>/Android/data")
-    // 真实结果只会是 ENOENT；ENOENT 会以异常形式往上传，可能把调用方搞挂
-    // （system_server 里就是开机失败 → LSPosed 进安全模式）。这里让它也「成功」。
-    if (strchr(name, '/') != nullptr) {
-        return is_first_level_missing(norm, name);
-    }
-
-    return true;
-}
-
-/**
- * 把 mkdirat 的 (dirfd, path) 还原成绝对路径。
- *
- * @param out 输出缓冲
- * @param out_size 缓冲大小
- * @return 成功时返回 out，失败返回 nullptr（此时调用方直接放行）
- */
-static const char *resolve_mkdirat_path(int dirfd, const char *path, char *out, size_t out_size) {
-    if (path == nullptr || *path == '\0') {
-        return nullptr;
-    }
-    if (path[0] == '/') {
-        size_t len = strlen(path);
-        if (len >= out_size) {
-            return nullptr;
-        }
-        memcpy(out, path, len + 1);
-        return out;
-    }
-
-    // 相对 CWD 的调用（AT_FDCWD）与我们的目标无关，直接放过
-    if (dirfd < 0) {
-        return nullptr;
-    }
-
-    char link[32];
-    snprintf(link, sizeof(link), "/proc/self/fd/%d", dirfd);
-
-    ssize_t got = readlink(link, out, out_size - 1);
-    if (got <= 0) {
-        return nullptr;
-    }
-    out[got] = '\0';
-
-    // 拼接成 "<dirfd 目标>/<path>"
-    size_t base_len = (size_t) got;
-    size_t name_len = strlen(path);
-    if (base_len == 0 || base_len + 1 + name_len >= out_size) {
-        return nullptr;
-    }
-    if (out[base_len - 1] != '/') {
-        out[base_len++] = '/';
-    }
-    memcpy(out + base_len, path, name_len + 1);
-
-    return out;
-}
 
 // ============================================================================
 // 熔断
@@ -261,7 +108,7 @@ static bool burst_guard_should_pass() {
  * @return true 表示调用方应当直接返回 result_out（假装成功）；false 表示原样执行 syscall
  */
 static bool handle_top_level_mkdir(const char *syscall_name, const char *path, int *result_out) {
-    if (!is_top_level_on_external(path)) {
+    if (!blockdirs::is_top_level_on_external(path)) {
         return false;
     }
     if (hook_mode.load(std::memory_order_relaxed) == BLOCKDIRS_MODE_LOG_ONLY) {
@@ -293,7 +140,7 @@ static int do_mkdirat(int dirfd, const char *path, mode_t mode) {
 extern "C" __attribute__((used, noinline, visibility("default")))
 int blockdirs_mkdirat(int dirfd, const char *path, mode_t mode) {
     char absolute[BLOCKDIRS_MAX_PATH];
-    const char *resolved = resolve_mkdirat_path(dirfd, path, absolute, sizeof(absolute));
+    const char *resolved = blockdirs::resolve_mkdirat_path(dirfd, path, absolute, sizeof(absolute));
     if (resolved != nullptr) {
         int blocked_value = 0;
         if (handle_top_level_mkdir("mkdirat", resolved, &blocked_value)) {
@@ -331,6 +178,60 @@ static void install_one(const char *symbol, void *proxy) {
         return;
     }
     LOGI("%s hooked: target=%p stub=%p proxy=%p", symbol, result.target, result.stub, proxy);
+}
+
+// ============================================================================
+// 设备自检（给 App 用，安全）
+//
+// 只给**本 .so 里的一个假函数**装 hook，绝不碰 libc。用来在真机上验证：
+//   mmap 跳板 -> 改入口 -> 跳进代理 -> 返回值正确
+// 这条链路在目标 ROM 上到底通不通（PAC / BTI / mprotect 权限都会影响它）。
+// 自检通过 ≠ MediaProvider 里一定成功，但自检失败就一定不能开 native 层。
+// ============================================================================
+
+static std::atomic<int> g_self_test_calls{0};
+
+extern "C" __attribute__((noinline, used)) int blockdirs_self_test_target(int a) {
+    return a * 2;
+}
+
+extern "C" __attribute__((noinline, used)) int blockdirs_self_test_proxy(int a) {
+    g_self_test_calls.fetch_add(1, std::memory_order_relaxed);
+    return a * 2 + 1;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_top_yixiangren_blockdirs_nativebridge_BlockDirsNative_selfTest(
+        JNIEnv *env, jobject thiz) {
+    (void) thiz;
+    char buf[256];
+
+#if defined(__aarch64__)
+    g_self_test_calls.store(0, std::memory_order_relaxed);
+    blockdirs::HookResult result =
+            blockdirs::hook_address((void *) blockdirs_self_test_target,
+                                    (void *) blockdirs_self_test_proxy);
+    if (!result.ok) {
+        snprintf(buf, sizeof(buf), "FAIL(install): %s", result.reason);
+        return env->NewStringUTF(buf);
+    }
+
+    // volatile 函数指针：阻止编译器内联/常量折叠，保证真的走一次调用
+    volatile int (*fn)(int) = blockdirs_self_test_target;
+    int value = fn(21);
+    int calls = g_self_test_calls.load(std::memory_order_relaxed);
+    if (value == 43 && calls == 1) {
+        snprintf(buf, sizeof(buf), "OK: target=%p stub=%p delta=%lld", result.target,
+                 result.stub,
+                 (long long) ((intptr_t) result.stub - (intptr_t) result.target));
+    } else {
+        snprintf(buf, sizeof(buf), "FAIL(call): 返回 %d（期望 43）, proxy 调用 %d 次", value, calls);
+    }
+#else
+    snprintf(buf, sizeof(buf), "SKIP: 当前 ABI 不是 arm64");
+#endif
+
+    return env->NewStringUTF(buf);
 }
 
 // ============================================================================

@@ -34,6 +34,9 @@ import top.yixiangren.blockdirs.hook.installBlockDirsHooks
  * 拦截（真的返回成功、不建目录）只发生在 MediaProvider 里。
  */
 @YukiHookLibXposedEntry(
+    // 我们用到了 API 102 的热重载事件（onHotReloading / onHotReloaded），
+    // 所以最低版本也必须是 102，不能让它跑在只支持 101 的框架上
+    minApiVersion = 102,
     targetApiVersion = 102,
     scope = [
         Targets.MEDIA_PROVIDER_MODULE,

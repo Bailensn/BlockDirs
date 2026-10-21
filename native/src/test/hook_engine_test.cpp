@@ -1,4 +1,4 @@
-// hook_engine 的 arm64 真执行测试。
+// hook_engine + guard_policy 的 arm64 真执行测试。
 //
 // 跑法（CI 里也是这套）：
 //   aarch64-linux-gnu-g++ -std=c++17 -O1 -static -mbranch-protection=standard \
@@ -10,10 +10,13 @@
 // 它在 arm64 上**真的**执行：真的 mmap 跳板、真的改写指令、真的跳进代理函数。
 // 真机上翻过的「跳到未映射地址」这类问题，在这里就能被抓到。
 #include "hook_engine.h"
+#include "guard_policy.h"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
+#include <unistd.h>
 
 static int g_proxy_calls = 0;
 static int g_failures = 0;
@@ -89,6 +92,68 @@ int main() {
     // 7) 非法参数不能崩
     blockdirs::HookResult bad = blockdirs::hook_address(nullptr, (void *) test_proxy);
     CHECK(!bad.ok, "空 target 竟然成功了");
+
+    // ────────────────────────────────────────────────────────────────────
+    // 8) guard_policy：挡住该挡的、放过该放的
+    //
+    // 注意：CI 里会先 `sudo mkdir -p /storage/1234-ABCD/Music`，
+    // 这样「第一层目录已存在」和「不存在」两条分支都能测到。
+    // ────────────────────────────────────────────────────────────────────
+    struct PathCase {
+        const char *path;
+        bool expect;
+    };
+    const PathCase cases[] = {
+        // 外置卷根下第一层 -> 拦
+        {"/storage/1234-ABCD/Music", true},
+        {"/storage/1234-ABCD/Music/", true},        // 尾部 '/' 不影响
+        {"/storage/1234-ABCD/Android", true},
+        {"/mnt/media_rw/1234-ABCD/DCIM", true},
+        {"/mnt/secure/asec/Movies", true},
+        {"/mnt/user/0/1234-ABCD/Pictures", true},
+        {"/mnt/runtime/write/1234-ABCD/Download", true},
+        // 内部存储 -> 放过
+        {"/storage/emulated/0/Music", false},
+        {"/storage/emulated/0/Download/x", false},
+        {"/mnt/user/0/emulated/0/Music", false},
+        {"/mnt/runtime/read/emulated/0/Music", false},
+        // 卷根本身 -> 放过
+        {"/storage/1234-ABCD", false},
+        {"/storage/1234-ABCD/", false},
+        // 不相干路径 -> 放过
+        {"/data/system/foo", false},
+        {"/sdcard/Music", false},
+        {"", false},
+        // 更深层：父层已存在（CI 里建了）-> 放过
+        {"/storage/1234-ABCD/Music/Album", false},
+        // 更深层：父层不存在 -> 也拦（避免 ENOENT 往上冒）
+        {"/storage/5678-EFGH/Music/Album", true},
+    };
+    for (const auto &c : cases) {
+        bool got = blockdirs::is_top_level_on_external(c.path);
+        CHECK(got == c.expect, "policy(path=\"%s\") = %s，期望 %s", c.path,
+              got ? "true" : "false", c.expect ? "true" : "false");
+    }
+
+    // 9) resolve_mkdirat_path：绝对路径原样返回；AT_FDCWD 相对路径放过；
+    //    真实 dirfd 时用 /proc/self/fd 还原
+    char out[4096];
+    const char *abs = blockdirs::resolve_mkdirat_path(-1, "/storage/1234-ABCD/Music", out, sizeof(out));
+    CHECK(abs != nullptr && strcmp(abs, "/storage/1234-ABCD/Music") == 0,
+          "绝对路径还原失败: %s", abs ? abs : "(null)");
+
+    const char *rel = blockdirs::resolve_mkdirat_path(-100 /* AT_FDCWD */, "Music", out, sizeof(out));
+    CHECK(rel == nullptr, "AT_FDCWD + 相对路径应当放过，却还原成 %s", rel ? rel : "(null)");
+
+    int dirfd = open("/storage/1234-ABCD/Music", O_RDONLY);
+    if (dirfd >= 0) {
+        const char *viaFd = blockdirs::resolve_mkdirat_path(dirfd, "Album", out, sizeof(out));
+        CHECK(viaFd != nullptr && strcmp(viaFd, "/storage/1234-ABCD/Music/Album") == 0,
+              "dirfd 还原失败: %s", viaFd ? viaFd : "(null)");
+        close(dirfd);
+    } else {
+        printf("SKIP: /storage/1234-ABCD/Music 打不开（CI 里没建？），跳过 dirfd 还原测试\n");
+    }
 
     if (g_failures == 0) {
         printf("OK: 全部断言通过（%d 次调用都进了 proxy）\n", g_proxy_calls);

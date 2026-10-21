@@ -8,6 +8,7 @@ import android.content.pm.PackageManager
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
+import android.util.Log
 import android.util.TypedValue
 import android.view.View
 import android.widget.ImageView
@@ -20,6 +21,7 @@ import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.materialswitch.MaterialSwitch
 import com.google.android.material.snackbar.Snackbar
 import com.highcapable.yukihookapi.YukiHook
+import top.yixiangren.blockdirs.nativebridge.BlockDirsNative
 import com.highcapable.yukihookapi.runtime.bridge.FrameworkServiceBridge
 
 /**
@@ -29,6 +31,8 @@ import com.highcapable.yukihookapi.runtime.bridge.FrameworkServiceBridge
  * 顶部卡片点击跳转到博客说明页。
  */
 class MainActivity : Activity() {
+
+    private val TAG = "BlockDirs"
 
     /** YukiHook 框架服务监听的订阅句柄，用于 onDestroy 时取消注册 */
     private var frameworkService: FrameworkServiceBridge? = null
@@ -44,8 +48,34 @@ class MainActivity : Activity() {
         bindLinks()
         bindHideIconSwitch()
         bindActivationStatus()
+        runNativeSelfTest()
         bindUpdateCheck()
         checkUpdate()
+    }
+
+    /**
+     * native hook 引擎自检（安全）：只给本 .so 里的假函数装 hook，不碰 libc。
+     *
+     * 目的：在**真机**上确认 mmap 跳板 / 改入口 / 跳进代理这条链路可用
+     * （PAC、BTI、mprotect 权限都会影响它）。结果打在 logcat：
+     *   adb logcat -s BlockDirs
+     * 失败只在界面上提示一次，成功不打扰。
+     */
+    private fun runNativeSelfTest() {
+        Thread({
+            val result = runCatching { BlockDirsNative.selfTest() }
+                .getOrElse { "SKIP: native 库未加载（${it.javaClass.simpleName}）" }
+            Log.i(TAG, "native self-test -> $result")
+            if (result.startsWith("FAIL")) {
+                runOnUiThread {
+                    Snackbar.make(
+                        findViewById(android.R.id.content),
+                        "native 自检失败：$result",
+                        Snackbar.LENGTH_LONG
+                    ).show()
+                }
+            }
+        }, "blockdirs-self-test").apply { isDaemon = true }.start()
     }
 
     override fun onDestroy() {

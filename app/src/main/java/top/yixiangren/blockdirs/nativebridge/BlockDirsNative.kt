@@ -46,6 +46,13 @@ object BlockDirsNative {
     }
 
     /**
+     * 设备自检：只给本 .so 里的一个假函数装 hook，**不碰 libc**，任何线程都可以调。
+     *
+     * @return "OK: ..." / "FAIL(...): 原因" / "SKIP: 当前 ABI 不是 arm64"
+     */
+    external fun selfTest(): String
+
+    /**
      * 在目标进程内安装 libc `mkdir` / `mkdirat` 的 inline hook。
      *
      * 实现见 native/src/main/cpp/blockdirs.cpp：mmap 一页跳板（在目标 ±128MB 内），
