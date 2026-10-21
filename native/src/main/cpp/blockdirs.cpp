@@ -46,6 +46,8 @@
 #include <sys/syscall.h>
 #include <android/log.h>
 
+#include "hook_engine.h"
+
 #define TAG "BlockDirsNative"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
@@ -311,100 +313,11 @@ int blockdirs_mkdir(const char *path, mode_t mode) {
 }
 
 // ============================================================================
-// 最小 arm64 inline hook
+// 安装：dlsym 找符号 -> 交给 hook_engine 改入口
 //
-// 把目标函数入口的 4 字节换成一条 b 指令，跳到我们 mmap 出来的跳板页；
-// 跳板里是 `ldr x16, #8; br x16; .quad <代理函数地址>`，再间接跳进代理函数。
-//
-// 跳板必须 mmap 在目标附近：arm64 的 b 只有 ±128MB，而我们的 .so 在 /data/app 下，
-// 离 libc 很远。所以按 64KB 步进在目标附近找空页，用 MAP_FIXED_NOREPLACE
-// （绝不覆盖已有映射）落下来。
+// hook_engine 是纯 POSIX 的（不依赖 Android），所以同一份代码能在 CI 上用
+// aarch64 交叉编译器 + qemu-aarch64 真跑一遍单测（native/src/test）。
 // ============================================================================
-
-#if defined(__aarch64__)
-
-#define BLOCKDIRS_PAGE_SIZE 4096
-
-/** 跳板与目标之间是否在 b 指令可达范围内 */
-static bool within_branch_range(uintptr_t stub, uintptr_t target) {
-    int64_t delta = (int64_t) stub - (int64_t) (target + 4);
-    return delta >= -(1LL << 27) && delta < (1LL << 27);
-}
-
-/**
- * 在目标函数附近 mmap 一页可写内存（先 RW，写完再改成 RX）。
- *
- * @return 成功返回页地址，失败返回 nullptr
- */
-static void *map_stub_page(uintptr_t target) {
-    uintptr_t base = target & ~(uintptr_t) (BLOCKDIRS_PAGE_SIZE - 1);
-
-#ifdef MAP_FIXED_NOREPLACE
-    for (int i = 1; i <= 0x80; i++) {
-        for (int dir = -1; dir <= 1; dir += 2) {
-            uintptr_t addr = base + (uintptr_t) dir * (uintptr_t) i * 0x10000;
-            if (addr < 0x10000) {
-                continue;
-            }
-            void *p = mmap((void *) addr, BLOCKDIRS_PAGE_SIZE, PROT_READ | PROT_WRITE,
-                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-            if (p != MAP_FAILED) {
-                if (within_branch_range((uintptr_t) p, target)) {
-                    return p;
-                }
-                munmap(p, BLOCKDIRS_PAGE_SIZE);
-            }
-        }
-    }
-#endif
-
-    // 退路：只给 hint，落点自己检查是否还在可达范围内
-    void *p = mmap((void *) base, BLOCKDIRS_PAGE_SIZE, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (p != MAP_FAILED) {
-        if (within_branch_range((uintptr_t) p, target)) {
-            return p;
-        }
-        munmap(p, BLOCKDIRS_PAGE_SIZE);
-    }
-    return nullptr;
-}
-
-/** 往跳板页写 `ldr x16, #8; br x16; .quad proxy`，然后改成只读可执行 */
-static bool write_stub(void *page, void *proxy) {
-    uint32_t *code = (uint32_t *) page;
-    code[0] = 0x58000050u;   // ldr x16, #8   （字面量紧跟在 pc+8）
-    code[1] = 0xD61F0200u;   // br  x16
-    uintptr_t addr = (uintptr_t) proxy;
-    memcpy(&code[2], &addr, sizeof(addr));
-
-    if (mprotect(page, BLOCKDIRS_PAGE_SIZE, PROT_READ | PROT_EXEC) != 0) {
-        return false;
-    }
-    __builtin___clear_cache((char *) page, (char *) page + 16);
-    return true;
-}
-
-/** 把目标函数入口 4 字节改成 `b stub` */
-static bool patch_entry(void *target, void *stub) {
-    uint32_t *site = (uint32_t *) target;
-    int64_t delta = (int64_t) (uintptr_t) stub - (int64_t) (uintptr_t) (site + 1);
-    if (delta < -(1LL << 27) || delta >= (1LL << 27)) {
-        return false;
-    }
-
-    uintptr_t page_start = (uintptr_t) site & ~(uintptr_t) (BLOCKDIRS_PAGE_SIZE - 1);
-    if (mprotect((void *) page_start, BLOCKDIRS_PAGE_SIZE,
-                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-        return false;
-    }
-
-    *site = 0x14000000u | ((uint32_t) (delta >> 2) & 0x03FFFFFFu);
-    __builtin___clear_cache((char *) site, (char *) site + 4);
-
-    mprotect((void *) page_start, BLOCKDIRS_PAGE_SIZE, PROT_READ | PROT_EXEC);
-    return true;
-}
 
 static void install_one(const char *symbol, void *proxy) {
     void *target = dlsym(RTLD_DEFAULT, symbol);
@@ -412,31 +325,13 @@ static void install_one(const char *symbol, void *proxy) {
         LOGE("%s: dlsym 失败", symbol);
         return;
     }
-    void *page = map_stub_page((uintptr_t) target);
-    if (page == nullptr) {
-        LOGE("%s: 找不到可用的跳板页（b 指令 ±128MB 内没有空页）", symbol);
+    blockdirs::HookResult result = blockdirs::hook_address(target, proxy);
+    if (!result.ok) {
+        LOGE("%s: hook 失败（%s）", symbol, result.reason);
         return;
     }
-    if (!write_stub(page, proxy)) {
-        LOGE("%s: 跳板页写不进去（mprotect 失败）", symbol);
-        munmap(page, BLOCKDIRS_PAGE_SIZE);
-        return;
-    }
-    if (!patch_entry(target, page)) {
-        LOGE("%s: 入口改写失败（mprotect / 分支越界）", symbol);
-        munmap(page, BLOCKDIRS_PAGE_SIZE);
-        return;
-    }
-    LOGI("%s hooked: target=%p stub=%p proxy=%p", symbol, target, page, proxy);
+    LOGI("%s hooked: target=%p stub=%p proxy=%p", symbol, result.target, result.stub, proxy);
 }
-
-#else  // 非 arm64：只保证编译通过，不做任何 patch
-
-static void install_one(const char *, void *) {
-    LOGE("当前 ABI 不支持内联 hook（只实现了 arm64）");
-}
-
-#endif
 
 // ============================================================================
 // JNI 入口

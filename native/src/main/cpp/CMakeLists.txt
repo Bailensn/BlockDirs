@@ -15,7 +15,12 @@ set(CMAKE_CXX_STANDARD 17)
 # 现在 native 层完全自包含：自己 mmap 跳板页 + 改 libc 函数入口 4 字节 + 直接重做 syscall。
 # 好处：不依赖任何第三方 hook 框架的 TLS / 状态机，构建也快（不用 FetchContent 拉整个仓库）。
 
-add_library(blockdirs SHARED blockdirs.cpp)
+add_library(blockdirs SHARED
+    blockdirs.cpp
+    hook_engine.cpp)
+
+# hook_engine 是纯 POSIX 的（不依赖 Android），CI 会用 aarch64 交叉编译器 + qemu 对它
+# 跑真执行单测（native/src/test/hook_engine_test.cpp），所以别往里加 Android 头文件。
 
 target_compile_options(blockdirs PRIVATE
     # arm64 上让每个函数入口带 `bti c`：我们是用 `br x16` 间接跳进代理函数的，

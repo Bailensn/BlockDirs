@@ -150,9 +150,57 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # ── 1.5) native hook 引擎的单测：在 arm64 上真执行，不碰真机 ────────────────
+  #
+  # 为什么需要它：native 层在真机上翻过三次车（跳到未映射地址 / 空指针），每次都是
+  # 把用户手机的 MediaProvider 打崩。这里用 aarch64 交叉编译器 + qemu-user-static
+  # 把 hook_engine 真跑一遍：真的 mmap 跳板、真的改指令、真的跳进代理函数。
+  # 跳板距离、b 指令编码、重复安装这些算术问题，在这里就该被抓出来。
+  test-native:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install cross compiler and qemu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            g++-aarch64-linux-gnu qemu-user-static
+
+      - name: Build and run arm64 hook engine test (qemu user mode)
+        run: |
+          set -o pipefail
+          aarch64-linux-gnu-g++ -std=c++17 -O1 -static -mbranch-protection=standard \
+            -Inative/src/main/cpp \
+            native/src/main/cpp/hook_engine.cpp \
+            native/src/test/hook_engine_test.cpp \
+            -o hook_engine_test 2>&1 | tee native-test-build.log
+          qemu-aarch64-static ./hook_engine_test
+
+      - name: Dump native test errors
+        if: failure()
+        run: |
+          DETAIL=$(awk '/error:|FAIL:|FAILED:|undefined reference/{print}' native-test-build.log 2>/dev/null | head -n 12 || true)
+          {
+            echo '## native 单测失败'
+            echo '```text'
+            echo "${DETAIL:-（没抓到编译错误，可能是 qemu 运行时断言失败）}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+          i=0
+          while IFS= read -r line; do
+            if [ -z "$line" ]; then continue; fi
+            msg=${line//'%'/'%25'}
+            msg=${msg//$'\r'/}
+            echo "::error title=native-test::${msg}"
+            i=$((i + 1))
+            if [ "$i" -ge 10 ]; then break; fi
+          done <<< "$DETAIL"
+
   # ── 2) 只有 build 成功且 apk_ok=true 时才会执行 ──────────────────────────
   release:
-    needs: build
+    needs: [ build, test-native ]
     if: ${{ needs.build.outputs.apk_ok == 'true' }}
     runs-on: ubuntu-latest
     steps:

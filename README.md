@@ -186,6 +186,28 @@ top.yixiangren.blockdirs/
 `gradle/actions/setup-gradle@v6`、`softprops/action-gh-release@v3`。
 （若使用自托管 Runner，需 Runner 版本 ≥ 2.327.1。）
 
+### native 层单测（CI 自动跑，不碰真机）
+
+`hook_engine`（mmap 跳板 + 改入口 4 字节）是纯 POSIX 代码，抽在
+`native/src/main/cpp/hook_engine.{h,cpp}`，可以在 CI 上用 **aarch64 交叉编译器 + qemu-user**
+真跑一遍 —— 真的 mmap、真的改指令、真的跳进代理函数。
+
+```bash
+# 等价于 CI 里 test-native job 做的事
+sudo apt-get install -y g++-aarch64-linux-gnu qemu-user-static
+aarch64-linux-gnu-g++ -std=c++17 -O1 -static -mbranch-protection=standard \
+  -Inative/src/main/cpp \
+  native/src/main/cpp/hook_engine.cpp native/src/test/hook_engine_test.cpp \
+  -o hook_engine_test
+qemu-aarch64-static ./hook_engine_test
+```
+
+断言覆盖：跳板是否落在 `b` 的 ±128MB 内、入口指令解码回来是否正好是跳板地址、
+调用是否真的进了代理函数、连续 100 次调用是否仍生效、重复安装是否安全。
+
+> 为什么加这个：native 层在真机上翻过三次车（跳到未映射地址 / 空指针），
+> 每次都是把手机的 MediaProvider 打崩。这类算术问题必须先在这里暴露。
+
 ### 本地构建
 
 ```bash
