@@ -20,10 +20,10 @@ Android 的 MediaProvider（`com.android.providers.media.module`，UID `10176`�
 `HookEntry_YukiHookXposedInit` 入口类与 `META-INF/xposed/{java_init.list,module.prop,scope.list}`。
 它在**两个**作用域目标进程里分别安装拦截：
 
-| 目标进程 | 负责创建的目录 | 装的 Hook |
+| 目标进程 | 干什么 | 模式 |
 |---|---|---|
-| `com.android.providers.media[.module]`（MediaProvider） | `Music` / `Pictures` / `DCIM` / `Movies` / `Downloads` … | native（主）+ Java 兜底 |
-| `system`（system_server 的虚拟包名，**默认不勾**） | `Android/`（`Android/data`、`Android/obb` 的副产物） | 仅 native |
+| `com.android.providers.media[.module]`（MediaProvider） | 拦 `Music` / `Pictures` / `DCIM` / `Movies` / `Downloads` … 的创建 | **真拦截**（native 主 + Java 兜底） |
+| `system`（system_server 的虚拟包名，**默认不勾**） | 排查用：记录谁在卷根建目录 | **只记日志，绝不改变返回值** |
 
 两层拦截：
 
@@ -35,6 +35,13 @@ Android 的 MediaProvider（`com.android.providers.media.module`，UID `10176`�
 2. **Java 层（兜底，YukiHook Hook + KavaRef 反射，仅 MediaProvider）**
    用 KavaRef 解析 `java.io.File#mkdir` / `#mkdirs`，命中同一判定规则时直接返回成功但不真正建目录。
    在 system_server 里不装这一层（全局 Hook `File.mkdir(s)` 影响面太大）。
+
+**安全设计（重要）**：拦截只发生在 MediaProvider —— 那里判断错了最多是某个媒体目录没出现，
+最坏情况也只是 MediaProvider 自己重启，不会牵连开机。system_server 那条路（勾了「系统框架」才会走）
+固定以 `MODE_LOG_ONLY` 安装：命中只往 logcat 打一行，返回值永远交给原函数，
+**从设计上不可能让开机失败**（也就不会再触发 LSPosed 把全部模块禁用的安全模式）。
+另外 native 侧还有熔断：5 秒内拦截超过 512 次就判定「有代码在死循环重试」，立刻放行（fail open），
+宁可漏拦也不把进程拖死在 hook 里。
 
 ### 热重载（Hot Reload）
 
@@ -69,12 +76,17 @@ Android 的 MediaProvider（`com.android.providers.media.module`，UID `10176`�
 
 ### 已知限制（重要）
 
-- **`vold` / `installd` 创建的目录拦不到。** 这两个是 init 拉起的 **native 守护进程**，不是 Java 应用进程，Xposed / libxposed 注入不进去。如果某个目录（常见的就是 `Android/`）最终是它们建的，任何 Xposed 模块都无能为力 —— 需要从别的层面解决（magisk 模块 / 内核 / FUSE 层过滤）。
-- 想确认某个目录到底是谁建的，插卡时看日志：
+- **`Android/` 大概率不是 system_server 建的。** 翻过 AOSP 源码：`StorageManagerService`（system_server 的存储服务）
+  在挂载流程里**没有**建外置卷 `Android/` 的代码，只有 `mkdirs(callingPkg, appPath)` 这种「应用请求自己的外置目录」
+  才走的分支；`vold` 的 `PublicVolume` 也只 `mkdir("/mnt/secure/asec")`。所以它更可能是 **`installd`
+  （native 守护进程）或应用自己**建的 —— 这类进程 Xposed 注入不进去，得从 FUSE / 内核 / magisk 层解决。
+- 想确认到底是谁在建：勾上「系统框架」（此时是 log-only，纯记录、不改行为），插卡后看
   ```bash
-  adb logcat -c && adb logcat | grep -i BlockDirs
+  adb logcat -c && adb logcat | grep -iE 'BlockDirsNative|BlockDirs'
   ```
-  出现 `BLOCKED mkdir(at) ... /…/Android` 说明我们命中了；一条都没有说明它不在 MediaProvider / system_server 进程里。
+  - `BLOCKED mkdir...`：MediaProvider 里被我们拦了；
+  - `HOOKED(log-only) mkdir...`：system_server 里有人建（这次只记录，下次可针对性处理）；
+  - 一条都没有：说明既不是 MediaProvider 也不是 system_server 建的。
 
 ### 副作用（请知悉）
 
@@ -203,15 +215,14 @@ META-INF/xposed/scope.list
 2. 打开 LSPosed（需支持 libxposed 现代 API），启用模块。模块已内置作用域推荐（`scope.list`），**默认只预选下面两项**：
    - **com.android.providers.media.module**（MediaProvider，媒体目录）
    - **com.android.providers.media**（旧版包名，部分机型）
-3. **（可选，想连 `Android/` 一起拦才做）** 手动勾上 **系统框架**（包名是 **`system`**，见下方注意）。
+3. **（可选，仅排查用）** 手动勾上 **系统框架**（包名是 **`system`**）：只会把「谁在卷根建目录」打进 logcat，**不会**改变系统行为。
 4. 重启手机（或重启 MediaProvider / 软重启使注入生效）。
 5. 插入 OTG U 盘 / SD 卡，观察其根目录不再自动生成媒体目录。
 
-> ⚠️ **「系统框架」默认没勾，是有意为之**：在 system_server 里 hook libc 的 `mkdir` 处在开机关键路径上，
-> 一旦行为不对（返回成功但目录没建、调用方随后又去读写），可能让某个系统服务异常甚至开机失败。
-> 那时候 LSPosed 会判定开机失败、**把所有模块一起禁用**，进它自己的「安全模式」（不是手机的安全模式）：
-> 手机数据、模块配置都还在，正常重启一次 + 在 LSPosed 里重新启用模块即可恢复，不用刷机。
-> 只想让媒体目录不被创建的话，**不要勾系统框架**，MediaProvider 那一层就够用了。
+> 「系统框架」默认没勾：它只用于排查（log-only，见上文「安全设计」），**不影响拦截效果** ——
+> 媒体目录的拦截全部发生在 MediaProvider 那一层。
+> 另外若真发生过开机失败，LSPosed 会把所有模块一起禁用、进它自己的安全模式（不是手机的安全模式）；
+> 数据与配置都在，重启一次 + 重新启用模块即可恢复，不用刷机。
 
 > **别勾错**：LSPosed 里「系统框架」的包名是 `system`（libxposed 的虚拟包名，代表 system_server）；
 > 「Android 系统」的包名是 `android`（framework-res，uid 1000），它的组件跑在单独的 `:ui` 进程，

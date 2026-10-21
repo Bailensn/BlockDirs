@@ -28,10 +28,10 @@ import top.yixiangren.blockdirs.hook.installBlockDirsHooks
  * 不用重启手机。native 层的 libc hook 会被有意保留（见 `onHotReloading` 的注释），
  * Java 层由 YukiHook 自己在 `onHotReloaded` 里恢复；如需显式控制可改成 `HotReload.MANUAL`。
  *
- * ⚠️ `system` **故意不写进推荐作用域**：在 system_server 里 hook libc 的 mkdir 属于开机关键路径，
- * 只要行为不对（比如返回成功但目录没建、调用方随后又去读写），就可能让某个系统服务异常，
- * 甚至开机失败 —— 那时 LSPosed 会把**所有模块**一起禁用、进它自己的安全模式。
- * 想拦 `Android/` 的用户需要在 LSPosed 里手动勾「系统框架」，这一步故意留给用户自己决定。
+ * ⚠️ `system` **不写进推荐作用域**，而且即便手动勾了，这条路径也**只做诊断**：
+ * C++ 侧以 `MODE_LOG_ONLY` 安装，命中时只往 logcat 打一行、返回值永远交给原函数，
+ * 所以它不可能再让开机流程失败（LSPosed 安全模式那条路已经堵死）。
+ * 拦截（真的返回成功、不建目录）只发生在 MediaProvider 里。
  */
 @YukiHookLibXposedEntry(
     targetApiVersion = 102,

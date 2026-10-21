@@ -28,9 +28,11 @@ fun PackageParam.installBlockDirsHooks(inSystemServer: Boolean = false) {
 
 /** native 层：libc mkdir / mkdirat（幂等） */
 private fun PackageParam.installNativeHook(inSystemServer: Boolean) {
+    // system_server 里只做诊断（log-only），绝不改变返回值 —— 开机关键路径不能碰
+    val mode = if (inSystemServer) BlockDirsNative.MODE_LOG_ONLY else BlockDirsNative.MODE_BLOCK
     try {
-        BlockDirsNative.installOnce()
-        val where = if (inSystemServer) "system_server" else packageName
+        BlockDirsNative.installOnce(mode)
+        val where = if (inSystemServer) "system_server(log-only)" else packageName
         Log.i(TAG, "native libc mkdir/mkdirat hook installed in $where")
     } catch (t: Throwable) {
         Log.e(TAG, "native hook install failed in $packageName", t)

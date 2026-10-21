@@ -6,6 +6,8 @@
 #include <unistd.h>
 #include <android/log.h>
 #include <sys/stat.h>
+#include <time.h>
+#include <atomic>
 
 #include "shadowhook.h"
 
@@ -30,6 +32,22 @@ static int (*orig_mkdirat)(int, const char *, mode_t) = nullptr;
 static void *mkdir_stub = nullptr;
 static void *mkdirat_stub = nullptr;
 static bool shadowhook_ready = false;
+
+// Hook 工作模式（由 Java 侧传入；热重载时会重新设置）：
+//   0 = 真拦截，只在 MediaProvider 里用
+//   1 = 只记日志、绝不改变行为，system_server 里用 —— 用来排查到底是谁在建目录，
+//       且不可能影响开机（LSPosed 安全模式那条路彻底堵死）
+#define BLOCKDIRS_MODE_BLOCK 0
+#define BLOCKDIRS_MODE_LOG_ONLY 1
+static int hook_mode = BLOCKDIRS_MODE_BLOCK;
+
+// 熔断：短时间内拦截次数爆表说明有代码在死循环重试（FUSE / 媒体扫描都可能），
+// 这时放行（fail open）—— 宁可漏拦也不能把进程拖死在 hook 里。
+#define BLOCKDIRS_BURST_LIMIT 512
+#define BLOCKDIRS_BURST_WINDOW_SEC 5
+static std::atomic<long long> burst_window_start{0};
+static std::atomic<long long> burst_blocks{0};
+static std::atomic<bool> burst_tripped{false};
 
 // 判断路径是否是「外置卷根目录下的第一层目录」。
 //
@@ -135,43 +153,52 @@ static bool is_top_level_on_external(const char *path) {
     return true;
 }
 
-// mkdirat 允许相对路径（dirfd + name）。把 dirfd 还原成绝对路径后再判断，
-// 否则 libfuse 之类用相对路径建目录的调用方会被漏掉。
-static bool is_top_level_on_external_at(int dirfd, const char *path) {
+/**
+ * 把 mkdirat 的 (dirfd, path) 还原成绝对路径。
+ *
+ * @param out 输出缓冲
+ * @param out_size 缓冲大小
+ * @return 成功时返回 out，失败返回 nullptr（此时调用方直接放行）
+ */
+static const char *resolve_mkdirat_path(int dirfd, const char *path, char *out, size_t out_size) {
     if (path == nullptr || *path == '\0') {
-        return false;
+        return nullptr;
     }
     if (path[0] == '/') {
-        return is_top_level_on_external(path);
+        size_t len = strlen(path);
+        if (len >= out_size) {
+            return nullptr;
+        }
+        memcpy(out, path, len + 1);
+        return out;
     }
 
     // 相对 CWD 的调用（AT_FDCWD）与我们的目标无关，直接放过
     if (dirfd < 0) {
-        return false;
+        return nullptr;
     }
 
     char link[32];
     snprintf(link, sizeof(link), "/proc/self/fd/%d", dirfd);
 
-    char resolved[BLOCKDIRS_MAX_PATH];
-    ssize_t got = readlink(link, resolved, sizeof(resolved) - 1);
+    ssize_t got = readlink(link, out, out_size - 1);
     if (got <= 0) {
-        return false;
+        return nullptr;
     }
-    resolved[got] = '\0';
+    out[got] = '\0';
 
-    // 拼接成 "<resolved>/<path>"
+    // 拼接成 "<dirfd 目标>/<path>"
     size_t base_len = (size_t) got;
     size_t name_len = strlen(path);
-    if (base_len == 0 || base_len + 1 + name_len >= sizeof(resolved)) {
-        return false;
+    if (base_len == 0 || base_len + 1 + name_len >= out_size) {
+        return nullptr;
     }
-    if (resolved[base_len - 1] != '/') {
-        resolved[base_len++] = '/';
+    if (out[base_len - 1] != '/') {
+        out[base_len++] = '/';
     }
-    memcpy(resolved + base_len, path, name_len + 1);
+    memcpy(out + base_len, path, name_len + 1);
 
-    return is_top_level_on_external(resolved);
+    return out;
 }
 
 // Hook 后的 mkdir
@@ -181,12 +208,60 @@ static bool is_top_level_on_external_at(int dirfd, const char *path) {
 //     否则 shadowhook 的 hub 会认为上一次代理调用「还在递归中」，
 //     从第二次调用起就不再回调本代理函数 —— 表现为「hook 只生效一次」。
 //  2) 调用原函数必须用 SHADOWHOOK_CALL_PREV 宏，不能直接调裸函数指针。
+/** 记一次拦截；返回 true 表示已熔断、调用方应当放行 */
+static bool burst_guard_should_pass() {
+    timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    long long now = (long long) ts.tv_sec;
+
+    long long start = burst_window_start.load(std::memory_order_relaxed);
+    if (start == 0 || now - start >= BLOCKDIRS_BURST_WINDOW_SEC) {
+        burst_window_start.store(now, std::memory_order_relaxed);
+        burst_blocks.store(0, std::memory_order_relaxed);
+        burst_tripped.store(false, std::memory_order_relaxed);
+        return false;
+    }
+    if (burst_tripped.load(std::memory_order_relaxed)) {
+        return true;
+    }
+    long long count = burst_blocks.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (count > BLOCKDIRS_BURST_LIMIT) {
+        burst_tripped.store(true, std::memory_order_relaxed);
+        LOGE("拦截次数异常（%lld 次 / %d 秒），疑似死循环重试，熔断放行以免拖死进程",
+             count, BLOCKDIRS_BURST_WINDOW_SEC);
+        return true;
+    }
+    return false;
+}
+
+/**
+ * 统一处理一次 `mkdir` 类调用。
+ *
+ * @return 需要由调用方返回给系统时给出返回值；返回 false 表示应由代理原样调用原函数
+ */
+static bool handle_top_level_mkdir(const char *syscall_name, const char *path, int *err_out) {
+    if (!is_top_level_on_external(path)) {
+        return false;
+    }
+    if (hook_mode == BLOCKDIRS_MODE_LOG_ONLY) {
+        LOGW("HOOKED(log-only) %s (top-level on external volume): %s", syscall_name, path);
+        return false;   // 只记录，绝不改变行为
+    }
+    if (burst_guard_should_pass()) {
+        LOGW("MELTED %s (too many blocks in a row), pass through: %s", syscall_name, path);
+        return false;
+    }
+    LOGW("BLOCKED %s (top-level on external volume): %s", syscall_name, path);
+    *err_out = 0;   // 假装成功
+    return true;
+}
+
 static int my_mkdir(const char *path, mode_t mode) {
     SHADOWHOOK_STACK_SCOPE();
 
-    if (is_top_level_on_external(path)) {
-        LOGW("BLOCKED mkdir (top-level on external volume): %s", path);
-        return 0;
+    int result = 0;
+    if (handle_top_level_mkdir("mkdir", path, &result)) {
+        return result;
     }
     return SHADOWHOOK_CALL_PREV(my_mkdir, path, mode);
 }
@@ -195,9 +270,15 @@ static int my_mkdir(const char *path, mode_t mode) {
 static int my_mkdirat(int dirfd, const char *path, mode_t mode) {
     SHADOWHOOK_STACK_SCOPE();
 
-    if (is_top_level_on_external_at(dirfd, path)) {
-        LOGW("BLOCKED mkdirat (top-level on external volume): dirfd=%d path=%s", dirfd, path);
-        return 0;
+    // 相对路径要先经 /proc/self/fd/<dirfd> 还原成绝对路径
+    char absolute[BLOCKDIRS_MAX_PATH];
+    const char *resolved = resolve_mkdirat_path(dirfd, path, absolute, sizeof(absolute));
+
+    if (resolved != nullptr) {
+        int result = 0;
+        if (handle_top_level_mkdir("mkdirat", resolved, &result)) {
+            return result;
+        }
     }
     return SHADOWHOOK_CALL_PREV(my_mkdirat, dirfd, path, mode);
 }
@@ -237,8 +318,9 @@ static void hook_libc_symbol(const char *sym, void *new_addr, void **orig_addr, 
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_top_yixiangren_blockdirs_nativebridge_BlockDirsNative_installNativeHook(JNIEnv *env, jclass clazz) {
-    LOGI("installNativeHook: block ALL top-level dirs on external volumes");
+Java_top_yixiangren_blockdirs_nativebridge_BlockDirsNative_installNativeHook(JNIEnv *env, jclass clazz, jint mode) {
+    hook_mode = (mode == BLOCKDIRS_MODE_LOG_ONLY) ? BLOCKDIRS_MODE_LOG_ONLY : BLOCKDIRS_MODE_BLOCK;
+    LOGI("installNativeHook: mode=%s", hook_mode == BLOCKDIRS_MODE_BLOCK ? "block" : "log-only(diagnostics)");
 
     if (!ensure_shadowhook()) return;
 
