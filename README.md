@@ -29,9 +29,23 @@ Android 的 MediaProvider（`com.android.providers.media.module`，UID `10176`�
 
 1. **native 层（主拦截，ShadowHook inline hook）**
    Hook 目标进程内 libc 的 `mkdir` / `mkdirat`。
+   代理函数必须带 `SHADOWHOOK_STACK_SCOPE()`、并用 `SHADOWHOOK_CALL_PREV` 调原函数 ——
+   否则 ShadowHook 会认为上一次代理调用「还在递归中」，**从第二次调用起就不再回调**（hook 形同虚设）。
+   这条修正同步自上游 `0dd79e6a`（他们后来 revert 删除功能时误删了，我们保留）。
 2. **Java 层（兜底，YukiHook Hook + KavaRef 反射，仅 MediaProvider）**
    用 KavaRef 解析 `java.io.File#mkdir` / `#mkdirs`，命中同一判定规则时直接返回成功但不真正建目录。
    在 system_server 里不装这一层（全局 Hook `File.mkdir(s)` 影响面太大）。
+
+### 热重载（Hot Reload）
+
+入口声明了 `hotReload = HotReload.AUTO`：APK 更新后框架会直接把新代码热重载进正在运行的目标进程
+（system_server / MediaProvider），**不用重启手机**。
+
+- **Java 层**：由 YukiHook 在 `onHotReloaded` 里自动恢复（旧 hook handle 卸载，新实例重新 hook）。
+- **native 层**：**故意保留不卸载**。libxposed 热重载不会 `dlclose` 模块的 `.so`、也不会调
+  `JNI_OnUnload`，所以旧一代装的 libc hook 依然有效；主动 unhook 反而会和正在执行的 hook 线程
+  抢 trampoline。新一代实例再次 `installNativeHook()` 会被 C 层的 stub 守卫挡住，不会重复 hook。
+- 想改成「只在模块里手动触发」：把注解里的 `HotReload.AUTO` 换成 `HotReload.MANUAL`。
 
 两层都采用**位置判定法**而非「黑名单目录名」：
 
