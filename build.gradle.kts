@@ -16,4 +16,6 @@ buildscript {
 plugins {
     id("com.android.application") version "9.4.1" apply false
     id("com.android.library") version "9.4.1" apply false
+    // YukiHook 1.5 通过 KSP 生成 Xposed 入口类与 META-INF/xposed/* 元数据
+    id("com.google.devtools.ksp") version "2.3.12" apply false
 }

@@ -3,8 +3,8 @@
 阻止手机在插入 OTG U 盘 / SD 卡等**外置可移动存储**时，自动在其根目录创建 `Android`、`Music`、`Pictures`、`DCIM`、`Movies` 等标准媒体目录的模块。
 
 - Xposed API：**libxposed API 102**（现代 Xposed API，`io.github.libxposed:api:102.0.0`）
-- 反射库：**KavaRef**（`com.highcapable.kavaref:*`，YukiHookAPI 1.3.0+ 官方反射引擎）
-- Hook 适配层：内置 `HookBridge` 抽象，已为 **YukiHook** 预留接入位（见下文）
+- Hook 框架：**YukiHook 1.5.0**（`com.highcapable.yukihookapi:*`，libxposed 底座）+ **KavaRef** 反射
+- 入口与 `META-INF/xposed/*` 元数据：由 `yukihook-compiler`（KSP）在编译期生成，仓库里不再手写
 
 > 已在 ColorOS 16（Android 16，实测 `PJZ110` / ColorOS V16.1.0）上端到端验证通过；理论上基于 AOSP 的系统也可使用。
 
@@ -12,11 +12,13 @@
 
 ## 背景
 
-Android 的 MediaProvider（`com.android.providers.media.module`，UID `10176`）在检测到外置存储卷首次挂载时，会在卷的根目录初始化一批标准媒体目录（`Android`、`Music`、`Pictures`、`DCIM`、`Movies` 等）。这些目录的创建并非走 Java 层的 `File.mkdir`，而是由 MediaProvider 通过 **native 层 FUSE** 直接调用 libc 的 `mkdir` / `mkdirat` 完成，因此常规的 Java 层 Hook 无法拦截。
+Android 的 MediaProvider（`com.android.providers.media.module`，UID `10176`）在检测到外置存储卷首次挂载时，会在卷的根目录初始化一批标准媒体目录（`Music`、`Pictures`、`DCIM`、`Movies` 等）。这些目录的创建并非走 Java 层的 `File.mkdir`，而是由 MediaProvider 通过 **native 层 FUSE** 直接调用 libc 的 `mkdir` / `mkdirat` 完成，因此常规的 Java 层 Hook 无法拦截。
 
 ## 原理
 
-模块入口 `top.yixiangren.blockdirs.BlockDirsModule` 继承 `io.github.libxposed.api.XposedModule`，在**两个**作用域目标进程里分别安装拦截：
+入口 `top.yixiangren.blockdirs.HookEntry` 是一个 `YukiHookXposedModule`，用 `@YukiHookLibXposedEntry` 声明作用域，KSP 据此生成
+`HookEntry_YukiHookXposedInit` 入口类与 `META-INF/xposed/{java_init.list,module.prop,scope.list}`。
+它在**两个**作用域目标进程里分别安装拦截：
 
 | 目标进程 | 负责创建的目录 | 装的 Hook |
 |---|---|---|
@@ -27,7 +29,7 @@ Android 的 MediaProvider（`com.android.providers.media.module`，UID `10176`�
 
 1. **native 层（主拦截，ShadowHook inline hook）**
    Hook 目标进程内 libc 的 `mkdir` / `mkdirat`。
-2. **Java 层（兜底，libxposed Hook + KavaRef 反射，仅 MediaProvider）**
+2. **Java 层（兜底，YukiHook Hook + KavaRef 反射，仅 MediaProvider）**
    用 KavaRef 解析 `java.io.File#mkdir` / `#mkdirs`，命中同一判定规则时直接返回成功但不真正建目录。
    在 system_server 里不装这一层（全局 Hook `File.mkdir(s)` 影响面太大）。
 
@@ -66,22 +68,26 @@ Android 的 MediaProvider（`com.android.providers.media.module`，UID `10176`�
 
 ---
 
-## 关于 YukiHookAPI
+## 关于 YukiHook 1.5
 
-本项目的 Hook 逻辑通过 `top.yixiangren.blockdirs.hook.HookBridge` 抽象，当前实现为 `LibxposedHookBridge`（官方 libxposed API 102），并为 YukiHook 预留了 `YukiHookBridge`。
+本项目基于 YukiHook **1.5.0**（2026-10 发布）。1.5.0 起项目更名为 YukiHook，并拆分为多个模块：
 
-**目前无法直接使用 YukiHookAPI 的 libxposed 能力**，原因是：
+| 模块 | 作用 |
+|---|---|
+| `yukihook-bom` | 统一版本管理 |
+| `yukihook-core` | 核心 Hook API、模块入口、模块状态 |
+| `yukihook-runtime-libxposed` | **libxposed 底座**（本模块使用的；另一个底座是 `yukihook-runtime-xposed82`） |
+| `yukihook-extension-kavaref` | 与 KavaRef 的衔接（`MemberResolver.hook` 等） |
+| `yukihook-compiler` | KSP 代码生成：入口类 + `META-INF/xposed/*` |
 
-- YukiHookAPI 稳定版 **1.3.2** 基于旧版 rovo89 Xposed API（`de.robv.android.xposed:api:82`），属于传统模块，不是 libxposed 102；
-- 原生支持 libxposed 的 **2.x 分支**在仓库里只有占位空壳（`object YukiHook` 无实现），且**未发布到 Maven Central / JitPack / HighCapable 公共仓库**；
-- 官方 README 提到的 **1.5.0 公测版**（支持 libxposed）目前仅通过 Telegram 群发放，同样不在任何公开 Maven 仓库。
+关键点：
 
-因此当前先用官方 libxposed API 102 + KavaRef 落地；等 YukiHook 发布可用的 libxposed 依赖后，只需：
-1. 引入其 libxposed 支持模块（`kavaref-core` / `kavaref-android` 继续保留）；
-2. 在 `YukiHookBridge` 中按官方 DSL 复刻拦截逻辑；
-3. 把 `HookEngine.bridge` 从 `LibxposedHookBridge` 改为 `YukiHookBridge`。
-
-详细步骤见 [`YukiHookBridge.kt`](app/src/main/java/top/yixiangren/blockdirs/hook/YukiHookBridge.kt) 顶部注释。
+- 入口用 `@YukiHookLibXposedEntry(targetApiVersion = 102, scope = [...])` 声明，
+  KSP 生成 `HookEntry_YukiHookXposedInit` 与 `java_init.list` / `module.prop` / `scope.list`，
+  **不要再手写**这些文件（重复会被 KSP 拒绝）。
+- 作用域里的 `system` 是 libxposed 代表 system_server 的**虚拟包名**，不是 `android`。
+- 「检查更新」卡片里的激活状态改用 `YukiHook.Status.observeFrameworkService` + `isModuleActive`，
+  不再自己维护 libxposed Service 连接。
 
 ---
 
@@ -92,25 +98,20 @@ top.yixiangren.blockdirs/
 ├── app/                                  # Android 应用（libxposed 入口 + 关于页 UI）
 │   └── src/main/
 │       ├── java/top/yixiangren/blockdirs/
-│       │   ├── BlockDirsModule.kt         # libxposed API 102 入口（XposedModule）
-│       │   ├── ActivationStatus.kt        # 激活状态检测（libxposed Service API）
-│       │   ├── MainActivity.java          # 关于页 UI
-│       │   ├── UpdateChecker.java         # 检查更新
+│       │   ├── HookEntry.kt               # YukiHook 入口（@YukiHookLibXposedEntry，作用域声明）
+│       │   ├── MainActivity.kt            # 关于页 UI（激活状态走 YukiHook.Status）
+│       │   ├── UpdateChecker.kt           # 检查更新
+│       │   ├── AppInfo.kt                 # 仓库地址单一来源
 │       │   ├── hook/
-│       │   │   ├── HookBridge.kt          # Hook 适配层抽象（为 YukiHook 预留）
-│       │   │   ├── LibxposedHookBridge.kt # libxposed 102 实现（native + KavaRef 兜底）
-│       │   │   ├── YukiHookBridge.kt      # YukiHook 适配层占位
-│       │   │   ├── HookEngine.kt          # 桥接实现选择
+│       │   │   ├── BlockDirsHooks.kt      # 各目标进程里安装拦截（native + KavaRef 兜底）
+│       │   │   ├── Targets.kt             # 目标进程 / 作用域包名
 │       │   │   └── DirGuardPolicy.kt      # 「位置判定法」共享实现
 │       │   ├── nativebridge/
 │       │   │   └── BlockDirsNative.kt     # native 库加载与 JNI 声明
 │       │   └── com/bytedance/shadowhook/
 │       │       └── ShadowHook.kt          # shadowhook JNI_OnLoad 防御性空壳类
-│       ├── resources/META-INF/xposed/     # 现代 Xposed 模块元数据
-│       │   ├── module.prop                # minApiVersion/targetApiVersion=102
-│       │   ├── java_init.list             # 入口类声明
-│       │   └── scope.list                 # 推荐作用域
 │       └── res/layout/activity_main.xml
+│       （META-INF/xposed/* 由 KSP 生成到 build/，不在源码树里）
 ├── native/                                # native hook 实现（ShadowHook + libc mkdir/mkdirat）
 │   ├── build.gradle.kts
 │   └── src/main/cpp/blockdirs.cpp
@@ -163,7 +164,11 @@ top.yixiangren.blockdirs/
 > 也可直接使用系统 Gradle：`gradle assembleRelease`。
 
 环境（全部为当前最新稳定版）：AGP 9.4.1、Gradle 9.8.1、JDK 21、Kotlin 2.4.21（AGP 9 内置 Kotlin，不再单独 apply `kotlin-android`）、
-compileSdk/targetSdk 36、NDK 30.0.16248370、CMake 4.1.2。构建脚本全部为 **Kotlin DSL**（`.gradle.kts`），模块代码全部为 **Kotlin**。
+KSP 2.3.12（YukiHook 代码生成）、compileSdk/targetSdk 36、NDK 30.0.16248370、CMake 4.1.2。
+构建脚本全部为 **Kotlin DSL**（`.gradle.kts`），模块代码全部为 **Kotlin**。
+
+> 构建时会由 KSP 生成 `HookEntry_YukiHookXposedInit` 与 `META-INF/xposed/{java_init.list,module.prop,scope.list}`，
+> 可在 `app/build/generated/ksp/release/resources/` 下核对。
 
 > AGP 9 起 `android.newDsl` / `android.builtInKotlin` / `android.uniquePackageNames` 默认开启：
 > 无需再应用 `org.jetbrains.kotlin.android`，且每个 library 必须有独立 `namespace`（本项目的 `:native` 使用 `top.yixiangren.blockdirs.nativelib`）。

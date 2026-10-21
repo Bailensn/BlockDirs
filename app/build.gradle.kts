@@ -2,6 +2,8 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
     id("com.android.application")
+    // YukiHook 的代码生成器（KSP）会产出 Xposed 入口类与 META-INF/xposed/* 元数据
+    id("com.google.devtools.ksp")
 }
 
 // 自动版本号：versionCode = git 提交数，versionName = "git+<短hash>"
@@ -16,7 +18,7 @@ val verName = "git+" + gitOutput("rev-parse", "--short=8", "HEAD")
 
 android {
     namespace = "top.yixiangren.blockdirs"
-    compileSdk = 37
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "top.yixiangren.blockdirs"
@@ -63,18 +65,26 @@ kotlin {
 }
 
 dependencies {
-    // === 现代 Xposed API：libxposed API 102 ===
-    // 入口类继承 io.github.libxposed.api.XposedModule，运行时由框架提供，因此 compileOnly
+    // === YukiHook 1.5（libxposed 底座） ===
+    // 1.5.0 起拆分为多个模块并统一版本发布，用 BOM 统一管理版本
+    implementation(platform("com.highcapable.yukihookapi:yukihook-bom:1.5.0"))
+    implementation("com.highcapable.yukihookapi:yukihook-core")
+    // libxposed API 底座
+    implementation("com.highcapable.yukihookapi:yukihook-runtime-libxposed")
+    // KavaRef 与 YukiHook 的衔接（MemberResolver.hook 等），KavaRef 本身需单独引入
+    implementation("com.highcapable.yukihookapi:yukihook-extension-kavaref")
+    // KSP 代码生成器：产出入口类 + META-INF/xposed/{java_init.list,module.prop,scope.list}
+    ksp("com.highcapable.yukihookapi:yukihook-compiler")
+
+    // === libxposed API 102：仅编译期需要，运行时由框架提供 ===
     compileOnly("io.github.libxposed:api:102.0.0")
     compileOnly("io.github.libxposed:annotation:1.0.0")
-    // Service API：模块 App 用来探测框架是否已连接、模块作用域是否包含目标进程
-    // （AAR 自带 XposedProvider，manifest 合并后由框架回传服务 Binder）
-    implementation("io.github.libxposed:service:102.0.0")
 
-    // === KavaRef：现代 Java 反射 API（YukiHookAPI 1.3.0+ 的官方反射引擎） ===
-    implementation("com.highcapable.kavaref:kavaref-core:1.1.1")
-    implementation("com.highcapable.kavaref:kavaref-android:1.1.1")
-    implementation("com.highcapable.kavaref:kavaref-extension:1.1.1")
+    // === KavaRef：现代 Java 反射 API ===
+    implementation(platform("com.highcapable.kavaref:kavaref-bom:1.1.1"))
+    implementation("com.highcapable.kavaref:kavaref-core")
+    implementation("com.highcapable.kavaref:kavaref-android")
+    implementation("com.highcapable.kavaref:kavaref-extension")
 
     implementation(project(":native"))
     implementation("androidx.appcompat:appcompat:1.8.0")

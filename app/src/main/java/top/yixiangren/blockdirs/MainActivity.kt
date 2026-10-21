@@ -19,6 +19,8 @@ import com.google.android.material.color.DynamicColors
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.materialswitch.MaterialSwitch
 import com.google.android.material.snackbar.Snackbar
+import com.highcapable.yukihookapi.YukiHook
+import com.highcapable.yukihookapi.runtime.bridge.FrameworkServiceBridge
 
 /**
  * BlockDirs 模块主页（视觉复刻 WeKit 风格）。
@@ -27,6 +29,9 @@ import com.google.android.material.snackbar.Snackbar
  * 顶部卡片点击跳转到博客说明页。
  */
 class MainActivity : Activity() {
+
+    /** YukiHook 框架服务监听的订阅句柄，用于 onDestroy 时取消注册 */
+    private var frameworkService: FrameworkServiceBridge? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -41,6 +46,12 @@ class MainActivity : Activity() {
         bindActivationStatus()
         bindUpdateCheck()
         checkUpdate()
+    }
+
+    override fun onDestroy() {
+        frameworkService?.unregister()
+        frameworkService = null
+        super.onDestroy()
     }
 
     /**
@@ -71,12 +82,14 @@ class MainActivity : Activity() {
     /**
      * 绑定「模块激活状态」卡片。
      *
-     * 通过 libxposed Service API（[ActivationStatus]）检测：
-     * 框架是否已连接、模块作用域是否包含 MediaProvider、是否有进程已被注入。
-     * 状态由框架实时决定，不依赖 zygote 注入，也不落任何持久化文件。
+     * 直接用 YukiHook 的模块状态 API：libxposed 底座下模块自身不会被注入，
+     * 激活状态通过与 Hook 框架服务（AIDL）的连接来判断，服务连接是异步的，
+     * 所以这里用 `observeFrameworkService` 监听，连上/断开都会回调（主线程）。
      */
     private fun bindActivationStatus() {
-        ActivationStatus.observe { active -> runOnUiThread { renderActivationStatus(active) } }
+        frameworkService = YukiHook.Status.observeFrameworkService { available ->
+            renderActivationStatus(available && YukiHook.Status.isModuleActive)
+        }
     }
 
     private fun renderActivationStatus(active: Boolean) {

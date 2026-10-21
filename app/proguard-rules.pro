@@ -1,7 +1,8 @@
 # BlockDirs R8 规则
 
-# Xposed 模块入口类与桥接层保持
-# （libxposed 框架通过 META-INF/xposed/java_init.list 反射实例化入口类，类名不能被混淆）
+# 模块入口保持。YukiHook 的 KSP 会生成
+# top.yixiangren.blockdirs.HookEntry_YukiHookXposedInit 写进 META-INF/xposed/java_init.list，
+# 框架按类名反射实例化，所以本包下所有类名都不能被混淆。
 -keep class top.yixiangren.blockdirs.** { *; }
 
 # 保持 libxposed 入口基类约定：任何继承 XposedModule 的入口都必须有公开无参构造
@@ -22,10 +23,11 @@
     native <methods>;
 }
 
-# libxposed API 的注解仅编译期存在（compileOnly），运行时无需解析
--dontwarn io.github.libxposed.annotation.**
+# libxposed API 仅编译期存在（compileOnly），运行时由框架提供
+-dontwarn io.github.libxposed.**
 
-# KavaRef 是编译期/运行期库，其反射目标是 JDK/Android 类，本身无需额外 keep
+# YukiHook / KavaRef 的反射目标是 JDK/Android 类，其 AAR 已自带 keep 规则
+-dontwarn com.highcapable.yukihookapi.**
 -dontwarn com.highcapable.kavaref.**
 -dontwarn kotlin.**
 
