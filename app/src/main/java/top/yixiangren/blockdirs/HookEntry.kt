@@ -27,13 +27,17 @@ import top.yixiangren.blockdirs.hook.installBlockDirsHooks
  * 热重载：`hotReload = HotReload.AUTO`，APK 更新后框架会直接热重载正在运行的目标进程，
  * 不用重启手机。native 层的 libc hook 会被有意保留（见 `onHotReloading` 的注释），
  * Java 层由 YukiHook 自己在 `onHotReloaded` 里恢复；如需显式控制可改成 `HotReload.MANUAL`。
+ *
+ * ⚠️ `system` **故意不写进推荐作用域**：在 system_server 里 hook libc 的 mkdir 属于开机关键路径，
+ * 只要行为不对（比如返回成功但目录没建、调用方随后又去读写），就可能让某个系统服务异常，
+ * 甚至开机失败 —— 那时 LSPosed 会把**所有模块**一起禁用、进它自己的安全模式。
+ * 想拦 `Android/` 的用户需要在 LSPosed 里手动勾「系统框架」，这一步故意留给用户自己决定。
  */
 @YukiHookLibXposedEntry(
     targetApiVersion = 102,
     scope = [
         Targets.MEDIA_PROVIDER_MODULE,
-        Targets.MEDIA_PROVIDER_LEGACY,
-        Targets.SYSTEM_SERVER
+        Targets.MEDIA_PROVIDER_LEGACY
     ],
     hotReload = HotReload.AUTO
 )

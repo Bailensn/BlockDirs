@@ -42,6 +42,28 @@ static bool shadowhook_ready = false;
 //   /mnt/user/<userId>/<UUID>/<name>
 //   /mnt/runtime/<access>/<UUID>/<name>
 // 排除：内部存储 emulated、更深层子目录、卷根本身。
+/**
+ * 判断「卷根 + 第一层目录名」这一层是否还不存在。
+ *
+ * @param norm 已经去掉尾部 '/' 的绝对路径
+ * @param name 第一层目录名开始的位置（可能还带着更深的 "/xxx" 尾巴）
+ */
+static bool is_first_level_missing(const char *norm, const char *name) {
+    const char *deeper = strchr(name, '/');       // 调用方保证非空
+    size_t prefix_len = (size_t) (name - norm);   // 含卷根末尾的 '/'
+    size_t name_len = (size_t) (deeper - name);
+
+    char first_level[BLOCKDIRS_MAX_PATH];
+    if (prefix_len + name_len >= sizeof(first_level)) {
+        return false;
+    }
+    memcpy(first_level, norm, prefix_len + name_len);
+    first_level[prefix_len + name_len] = '\0';
+
+    struct stat st{};
+    return stat(first_level, &st) != 0;   // 父层不在 -> 子路径也拦
+}
+
 static bool is_top_level_on_external(const char *path) {
     if (path == nullptr || *path == '\0') {
         return false;
@@ -100,9 +122,14 @@ static bool is_top_level_on_external(const char *path) {
         return false;
     }
 
-    // 更深层不拦
+    // 第一层目录不存在时，它下面的子路径也一并拦。
+    //
+    // 原因：父目录被我们拦掉（返回成功但没建），紧接着的 mkdir("<卷根>/Android/data")
+    // 真实结果只会是 ENOENT；而 ENOENT 会以异常形式往上传 —— 在 system_server 的开机
+    // 流程里这足以把进程搞挂，然后 LSPosed 判定开机失败、进它自己的安全模式（全模块禁用）。
+    // 所以这里改成「父目录不在就也返回成功」，让调用方以为建好了，避免异常冒泡。
     if (strchr(name, '/') != nullptr) {
-        return false;
+        return is_first_level_missing(norm, name);
     }
 
     return true;

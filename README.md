@@ -23,7 +23,7 @@ Android 的 MediaProvider（`com.android.providers.media.module`，UID `10176`�
 | 目标进程 | 负责创建的目录 | 装的 Hook |
 |---|---|---|
 | `com.android.providers.media[.module]`（MediaProvider） | `Music` / `Pictures` / `DCIM` / `Movies` / `Downloads` … | native（主）+ Java 兜底 |
-| `system`（system_server 的虚拟包名） | `Android/`（`Android/data`、`Android/obb` 的副产物） | 仅 native |
+| `system`（system_server 的虚拟包名，**默认不勾**） | `Android/`（`Android/data`、`Android/obb` 的副产物） | 仅 native |
 
 两层拦截：
 
@@ -100,6 +100,7 @@ Android 的 MediaProvider（`com.android.providers.media.module`，UID `10176`�
   KSP 生成 `HookEntry_YukiHookXposedInit` 与 `java_init.list` / `module.prop` / `scope.list`，
   **不要再手写**这些文件（重复会被 KSP 拒绝）。
 - 作用域里的 `system` 是 libxposed 代表 system_server 的**虚拟包名**，不是 `android`。
+  它**没有**写进 `scope.list`：system_server 属于开机关键路径，勾不勾由用户自己决定（默认只做 MediaProvider）。
 - 「检查更新」卡片里的激活状态改用 `YukiHook.Status.observeFrameworkService` + `isModuleActive`，
   不再自己维护 libxposed Service 连接。
 
@@ -199,12 +200,18 @@ META-INF/xposed/scope.list
 ## 安装与启用
 
 1. 安装构建出的 APK。
-2. 打开 LSPosed（需支持 libxposed 现代 API），启用模块。模块已内置作用域推荐（`scope.list`，会自动预选下面三项）：
+2. 打开 LSPosed（需支持 libxposed 现代 API），启用模块。模块已内置作用域推荐（`scope.list`），**默认只预选下面两项**：
    - **com.android.providers.media.module**（MediaProvider，媒体目录）
    - **com.android.providers.media**（旧版包名，部分机型）
-   - **系统框架**（包名是 **`system`**，用于 `Android/` 目录）
-3. 重启手机（或重启 MediaProvider / 软重启使注入生效）。
-4. 插入 OTG U 盘 / SD 卡，观察其根目录不再自动生成媒体目录。
+3. **（可选，想连 `Android/` 一起拦才做）** 手动勾上 **系统框架**（包名是 **`system`**，见下方注意）。
+4. 重启手机（或重启 MediaProvider / 软重启使注入生效）。
+5. 插入 OTG U 盘 / SD 卡，观察其根目录不再自动生成媒体目录。
+
+> ⚠️ **「系统框架」默认没勾，是有意为之**：在 system_server 里 hook libc 的 `mkdir` 处在开机关键路径上，
+> 一旦行为不对（返回成功但目录没建、调用方随后又去读写），可能让某个系统服务异常甚至开机失败。
+> 那时候 LSPosed 会判定开机失败、**把所有模块一起禁用**，进它自己的「安全模式」（不是手机的安全模式）：
+> 手机数据、模块配置都还在，正常重启一次 + 在 LSPosed 里重新启用模块即可恢复，不用刷机。
+> 只想让媒体目录不被创建的话，**不要勾系统框架**，MediaProvider 那一层就够用了。
 
 > **别勾错**：LSPosed 里「系统框架」的包名是 `system`（libxposed 的虚拟包名，代表 system_server）；
 > 「Android 系统」的包名是 `android`（framework-res，uid 1000），它的组件跑在单独的 `:ui` 进程，
