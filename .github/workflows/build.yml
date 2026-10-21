@@ -218,18 +218,28 @@ jobs:
             native/src/main/cpp/guard_policy.cpp \
             native/src/test/hook_engine_test.cpp \
             -o hook_engine_test 2>&1 | tee native-test-build.log
-          qemu-aarch64-static ./hook_engine_test
+          # 运行输出也落盘：段错误时至少能看到它跑到哪一条断言了
+          qemu-aarch64-static ./hook_engine_test 2>&1 | tee native-test-run.log
 
       - name: Dump native test errors
         if: failure()
         run: |
+          # 编译错误
           DETAIL=$(awk '/error:|FAIL:|FAILED:|undefined reference/{print}' native-test-build.log 2>/dev/null | head -n 12 || true)
+          # 运行输出（段错误时能看到跑到哪了、光标前的断言是哪个）
+          RUNTAIL=$(tail -n 20 native-test-run.log 2>/dev/null || true)
           {
             echo '## native 单测失败'
+            echo '### 编译错误'
             echo '```text'
-            echo "${DETAIL:-（没抓到编译错误，可能是 qemu 运行时断言失败）}"
+            echo "${DETAIL:-（没有编译错误）}"
+            echo '```'
+            echo '### 运行输出（最后 20 行）'
+            echo '```text'
+            echo "${RUNTAIL:-（没有运行输出，可能是编译阶段就失败了）}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+          DETAIL=$(printf '%s\n%s\n' "$DETAIL" "$RUNTAIL")
           i=0
           while IFS= read -r line; do
             if [ -z "$line" ]; then continue; fi

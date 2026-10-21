@@ -74,8 +74,9 @@ bool write_stub(void *page, void *proxy) {
 /** 把入口 4 字节改成 `b stub` */
 bool patch_entry(void *target, void *stub) {
     auto *site = static_cast<uint32_t *>(target);
+    // 基准必须是 site 本身，不能是 site+1（见 within_branch_range 的注释）
     int64_t delta = static_cast<int64_t>(reinterpret_cast<uintptr_t>(stub)) -
-                    static_cast<int64_t>(reinterpret_cast<uintptr_t>(site + 1));
+                    static_cast<int64_t>(reinterpret_cast<uintptr_t>(site));
     if (delta < -(1LL << 27) || delta >= (1LL << 27)) {
         return false;
     }
@@ -99,7 +100,9 @@ bool patch_entry(void *target, void *stub) {
 }  // namespace
 
 bool within_branch_range(uintptr_t stub, uintptr_t target) {
-    int64_t delta = static_cast<int64_t>(stub) - static_cast<int64_t>(target + 4);
+    // 注意：AArch64 的 B 偏移是相对**指令自身地址**的（ARMv7 才是 PC+8/+4）。
+    // 用 target+4 当基准会整体偏 4 字节 —— 真机上就是这么跳到「跳板 - 4」的未映射页崩掉的。
+    int64_t delta = static_cast<int64_t>(stub) - static_cast<int64_t>(target);
     return delta >= -(1LL << 27) && delta < (1LL << 27);
 }
 
