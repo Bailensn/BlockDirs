@@ -16,6 +16,9 @@ fun gitOutput(vararg args: String): String = project.providers.exec {
 val verCode = gitOutput("rev-list", "--count", "HEAD").toInt()
 val verName = "git+" + gitOutput("rev-parse", "--short=8", "HEAD")
 
+// YukiHook 全部模块统一版本（BOM + KSP 编译器共用）
+val yukihookVersion = "1.5.0"
+
 android {
     namespace = "top.yixiangren.blockdirs"
     compileSdk = 36
@@ -67,14 +70,17 @@ kotlin {
 dependencies {
     // === YukiHook 1.5（libxposed 底座） ===
     // 1.5.0 起拆分为多个模块并统一版本发布，用 BOM 统一管理版本
-    implementation(platform("com.highcapable.yukihookapi:yukihook-bom:1.5.0"))
+    implementation(platform("com.highcapable.yukihookapi:yukihook-bom:$yukihookVersion"))
     implementation("com.highcapable.yukihookapi:yukihook-core")
     // libxposed API 底座
     implementation("com.highcapable.yukihookapi:yukihook-runtime-libxposed")
     // KavaRef 与 YukiHook 的衔接（MemberResolver.hook 等），KavaRef 本身需单独引入
     implementation("com.highcapable.yukihookapi:yukihook-extension-kavaref")
     // KSP 代码生成器：产出入口类 + META-INF/xposed/{java_init.list,module.prop,scope.list}
-    ksp("com.highcapable.yukihookapi:yukihook-compiler")
+    // 注意：ksp 配置不会继承 implementation 的 BOM，必须自己再挂一次 platform 并显式带版本，
+    // 否则会报 "Could not resolve all files for configuration ':app:_agp_internal_release_kspClasspath'"
+    ksp(platform("com.highcapable.yukihookapi:yukihook-bom:$yukihookVersion"))
+    ksp("com.highcapable.yukihookapi:yukihook-compiler:$yukihookVersion")
 
     // === libxposed API 102：仅编译期需要，运行时由框架提供 ===
     compileOnly("io.github.libxposed:api:102.0.0")

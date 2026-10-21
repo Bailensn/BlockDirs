@@ -69,8 +69,8 @@ jobs:
             | grep -avE '^C/C\+\+: *(warning|note):' \
             | grep -avE '^C/C\+\+: *[0-9]+ *\|' \
             | head -n 40 || true)
-          # Kotlin / Gradle 自身的报错优先排在前面
-          PRIORITY=$(printf '%s\n' "$ERR_LINES" | grep -aE '^e: file:|^> Task .* FAILED|What went wrong|FAILURE:' || true)
+          # Kotlin / Gradle 自身的报错、以及依赖解析的根因（Caused by / Could not ...）优先排在前面
+          PRIORITY=$(printf '%s\n' "$ERR_LINES" | grep -aE '^e: file:|^> Task .* FAILED|What went wrong|FAILURE:|Caused by:|Could not resolve|Could not find|no version specified' || true)
           ORDERED=$(printf '%s\n%s\n' "$PRIORITY" "$ERR_LINES" | awk 'NF && !seen[$0]++')
 
           {
