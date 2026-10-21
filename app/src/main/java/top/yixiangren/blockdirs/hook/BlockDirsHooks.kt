@@ -12,9 +12,9 @@ private const val TAG = "BlockDirs"
  * 在目标进程里安装拦截。
  *
  * 分两层，互为补充：
- * 1. **native 层（主）**：加载 `libblockdirs.so`，用 ShadowHook inline hook libc 的
- *    `mkdir` / `mkdirat`。MediaProvider 走的就是 FUSE → libc 这条路径，这是唯一可靠、
- *    零遗漏的拦截点；`system_server` 里也都靠这一层。
+ * 1. **native 层（主）**：加载 `libblockdirs.so`，自己改 libc `mkdir` / `mkdirat`
+ *    入口的 4 字节跳到代理函数（不依赖任何第三方 hook 框架）。MediaProvider 走的就是
+ *    FUSE → libc 这条路径，这是唯一可靠、零遗漏的拦截点。
  * 2. **Java 层（兜底，仅 MediaProvider）**：用 KavaRef 解析 `java.io.File#mkdir` / `#mkdirs`，
  *    命中同一套「位置判定法」时直接返回成功但不真正建目录。system_server 里不装这一层，
  *    避免全局 Hook `File.mkdir(s)` 影响面过大。

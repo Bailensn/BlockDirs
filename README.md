@@ -27,14 +27,13 @@ Android 的 MediaProvider（`com.android.providers.media.module`，UID `10176`�
 
 两层拦截：
 
-1. **native 层（主拦截，ShadowHook inline hook）**
-   Hook 目标进程内 libc 的 `mkdir` / `mkdirat`。
-   代理函数必须带 `SHADOWHOOK_STACK_SCOPE()`（负责出代理时 pop frame，少这行 hook 会失效）；
-   但**调原函数必须用 hook 回填的 `orig` 指针，绝不能用 `SHADOWHOOK_CALL_PREV`** ——
-   后者走 `shadowhook_get_prev_func()`，直接解引用每线程 TLS 的 frame 栈：
-   `if (0 == stack->frames_cnt)`，`stack` 为 NULL 就是 SIGSEGV。
-   我们实测过：MediaProvider 的 `android.bg` 线程拿不到这个栈 → 段错误 → FUSE 守护进程跟着死 →
-   内部存储都挂不上。这条注释就是防止以后有人「好心」把它改回 CALL_PREV。
+1. **native 层（主拦截，自研最小 inline hook）**
+   把目标进程内 libc 的 `mkdir` / `mkdirat` 入口 4 字节改成 `b 跳板`；跳板（mmap 在目标
+   ±128MB 范围内）里是 `ldr x16, #8; br x16; .quad 代理函数`；代理函数**不调用原函数**，
+   直接重做一次 `syscall(SYS_mkdirat, ...)`，所以不需要保存原函数指针、也不用搬迁指令。
+   **完全不用 ShadowHook**：它的 `CALL_PREV` / `STACK_SCOPE` 都要读「每线程 TLS 的 frame 栈」，
+   在 MediaProvider 的 `android.bg` 线程上这个栈是 NULL → 段错误 → FUSE 守护进程死 →
+   内部存储挂不上（两次真机事故的复盘写在 `blockdirs.cpp` 顶部注释里，别再改回去）。
 2. **Java 层（兜底，YukiHook Hook + KavaRef 反射，仅 MediaProvider）**
    用 KavaRef 解析 `java.io.File#mkdir` / `#mkdirs`，命中同一判定规则时直接返回成功但不真正建目录。
    在 system_server 里不装这一层（全局 Hook `File.mkdir(s)` 影响面太大）。

@@ -1,55 +1,76 @@
+// BlockDirs native 层
+//
+// ============================================================================
+// 为什么不再用 shadowhook（两次把用户手机搞崩后的结论，别再改回去）
+// ============================================================================
+//
+// 第一版用 shadowhook 的 SHADOWHOOK_CALL_PREV，崩在 sh_hub_get_prev_func：
+//     sh_hub_stack_t *stack = sh_safe_pthread_getspecific(sh_hub_stack_tls_key);
+//     if (0 == stack->frames_cnt) ...      // ← stack 是 NULL，解引用 0x0
+// 第二版退回直接调 orig 指针、但留着 SHADOWHOOK_STACK_SCOPE()，崩在 sh_hub_pop_stack，
+// 是同一处 TLS 拿不到栈、同一个空指针。
+//
+// 也就是说：shadowhook 的「每线程 frame 栈」在这台机器（OnePlus / Android 16，
+// 进程 com.android.providers.media.module 的 android.bg 线程）上根本建立不起来，
+// 任何依赖它的 API（CALL_PREV / STACK_SCOPE）都会段错误。
+// 崩的是 MediaProvider —— 它就是 FUSE 守护进程，崩了内部存储都挂不上。
+//
+// 现在的做法：完全不用 shadowhook。
+//   * 直接改 libc 函数入口的 4 字节，跳到我们自己 mmap 出来的一小段跳板
+//     （`ldr x16, #8; br x16; .quad proxy`），跳板再做一次间接跳转进代理函数；
+//   * 代理函数内部**不调用原函数**，而是直接重做一次 syscall（mkdirat/mkdir 本来
+//     就是 syscall 包装），所以没有任何「原函数指针」需要保存，也不需要搬迁指令；
+//   * 不依赖任何 TLS / 框架内部状态，因此不会再有上面那类空指针；
+//   * 重复安装安全：入口已经是 b 跳转时，再按同样规则算偏移照样跳得对。
+//
+// ============================================================================
+// 安全设计
+// ============================================================================
+//  * 模式 0 = 真拦截（只在 MediaProvider）：命中返回 0 假装成功，但不真正建目录；
+//    模式 1 = 只记日志（system_server 用）：只打一行 logcat，行为零改变，
+//    所以就算勾了「系统框架」也不可能让开机失败。
+//  * 熔断：5 秒内拦截超过 512 次 → 认为有代码在死循环重试，直接放行（fail open），
+//    宁可漏拦也不能把进程拖死。
 #include <jni.h>
 #include <string.h>
 #include <stdio.h>
-#include <cstdlib>
-#include <dlfcn.h>
+#include <stdint.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <unistd.h>
-#include <android/log.h>
-#include <sys/stat.h>
+#include <dlfcn.h>
 #include <time.h>
 #include <atomic>
-
-#include "shadowhook.h"
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <android/log.h>
 
 #define TAG "BlockDirsNative"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-// 路径缓冲上限。
-// 刻意不依赖 PATH_MAX：不同 libc 把它放在 <limits.h> / <sys/param.h> / <linux/limits.h>
-// 的位置不一致，自己定一个常量最省事。
+// 路径缓冲上限。刻意不依赖 PATH_MAX（不同 libc 放的位置不一致）。
 #define BLOCKDIRS_MAX_PATH 4096
 
-// 原始函数指针（由 shadowhook 回填）
-static int (*orig_mkdir)(const char *, mode_t) = nullptr;
-static int (*orig_mkdirat)(int, const char *, mode_t) = nullptr;
-
-// shadowhook 返回的 stub（进程级共享）。
-// 热重载只会替换 Java 类加载器，libxposed 不会 dlclose 模块的 .so、也不会调 JNI_OnUnload，
-// 所以这里的静态状态在同一个进程里跨「模块世代」依然有效：新一代实例再次调用
-// installNativeHook 会被下面的守卫挡住，不会重复 hook。
-static void *mkdir_stub = nullptr;
-static void *mkdirat_stub = nullptr;
-static bool shadowhook_ready = false;
-
-// Hook 工作模式（由 Java 侧传入；热重载时会重新设置）：
-//   0 = 真拦截，只在 MediaProvider 里用
-//   1 = 只记日志、绝不改变行为，system_server 里用 —— 用来排查到底是谁在建目录，
-//       且不可能影响开机（LSPosed 安全模式那条路彻底堵死）
+// 工作模式（由 Java 侧传入）
 #define BLOCKDIRS_MODE_BLOCK 0
 #define BLOCKDIRS_MODE_LOG_ONLY 1
-static int hook_mode = BLOCKDIRS_MODE_BLOCK;
+static std::atomic<int> hook_mode{BLOCKDIRS_MODE_BLOCK};
 
-// 熔断：短时间内拦截次数爆表说明有代码在死循环重试（FUSE / 媒体扫描都可能），
-// 这时放行（fail open）—— 宁可漏拦也不能把进程拖死在 hook 里。
+// 熔断参数
 #define BLOCKDIRS_BURST_LIMIT 512
 #define BLOCKDIRS_BURST_WINDOW_SEC 5
 static std::atomic<long long> burst_window_start{0};
 static std::atomic<long long> burst_blocks{0};
 static std::atomic<bool> burst_tripped{false};
 
-// 判断路径是否是「外置卷根目录下的第一层目录」。
+// 已安装标记（进程级；热重载只换 Java 类加载器，.so 不会被 dlclose）
+static std::atomic<bool> hooks_installed{false};
+
+// ============================================================================
+// 策略：判断路径是否是「外置卷根目录下的第一层目录」
 //
 // 与 Kotlin 侧 DirGuardPolicy.isTopLevelOnExternal 保持一致，改一处必须同步另一处。
 //
@@ -59,7 +80,9 @@ static std::atomic<bool> burst_tripped{false};
 //   /mnt/secure/<...>/<name>
 //   /mnt/user/<userId>/<UUID>/<name>
 //   /mnt/runtime/<access>/<UUID>/<name>
-// 排除：内部存储 emulated、更深层子目录、卷根本身。
+// 排除：内部存储 emulated、卷根本身。
+// ============================================================================
+
 /**
  * 判断「卷根 + 第一层目录名」这一层是否还不存在。
  *
@@ -143,9 +166,8 @@ static bool is_top_level_on_external(const char *path) {
     // 第一层目录不存在时，它下面的子路径也一并拦。
     //
     // 原因：父目录被我们拦掉（返回成功但没建），紧接着的 mkdir("<卷根>/Android/data")
-    // 真实结果只会是 ENOENT；而 ENOENT 会以异常形式往上传 —— 在 system_server 的开机
-    // 流程里这足以把进程搞挂，然后 LSPosed 判定开机失败、进它自己的安全模式（全模块禁用）。
-    // 所以这里改成「父目录不在就也返回成功」，让调用方以为建好了，避免异常冒泡。
+    // 真实结果只会是 ENOENT；ENOENT 会以异常形式往上传，可能把调用方搞挂
+    // （system_server 里就是开机失败 → LSPosed 进安全模式）。这里让它也「成功」。
     if (strchr(name, '/') != nullptr) {
         return is_first_level_missing(norm, name);
     }
@@ -201,22 +223,10 @@ static const char *resolve_mkdirat_path(int dirfd, const char *path, char *out, 
     return out;
 }
 
-// Hook 后的 mkdir
-//
-// ⚠️ 踩过的坑，别再改回去：
-//
-// 1) 必须调用 SHADOWHOOK_STACK_SCOPE()（C++ RAII，函数退出时 pop_stack）。
-//    shadowhook 的每个线程有一个定长 frame 栈，进代理前 push、出代理后 pop；
-//    少了这行 pop，栈会被占满，之后 hub 直接绕过 hook —— 表现为「hook 只生效一次」。
-//    （这条修同步自上游 0dd79e6a，他们后来 revert 时误删了。）
-//
-// 2) **绝对不要用 SHADOWHOOK_CALL_PREV 调原函数**，直接用 hook 时回填的 orig 指针。
-//    CALL_PREV 会走 shadowhook_get_prev_func()，而它在 pinned commit 593f491b 里的实现是：
-//        sh_hub_stack_t *stack = sh_safe_pthread_getspecific(sh_hub_stack_tls_key);
-//        if (0 == stack->frames_cnt) sh_safe_abort();
-//    TLS 里的 stack 在某些进程/线程上拿不到（已实测：MediaProvider 的 android.bg 线程），
-//    于是 stack == NULL → 解引用 0x0 → SIGSEGV。我们就是这样把 MediaProvider 打崩、
-//    FUSE 守护进程跟着死、内部存储都挂载不上的。orig 指针没有这个依赖。
+// ============================================================================
+// 熔断
+// ============================================================================
+
 /** 记一次拦截；返回 true 表示已熔断、调用方应当放行 */
 static bool burst_guard_should_pass() {
     timespec ts{};
@@ -244,95 +254,210 @@ static bool burst_guard_should_pass() {
 }
 
 /**
- * 统一处理一次 `mkdir` 类调用。
+ * 统一处理一次 mkdir 类调用。
  *
- * @return 需要由调用方返回给系统时给出返回值；返回 false 表示应由代理原样调用原函数
+ * @return true 表示调用方应当直接返回 result_out（假装成功）；false 表示原样执行 syscall
  */
-static bool handle_top_level_mkdir(const char *syscall_name, const char *path, int *err_out) {
+static bool handle_top_level_mkdir(const char *syscall_name, const char *path, int *result_out) {
     if (!is_top_level_on_external(path)) {
         return false;
     }
-    if (hook_mode == BLOCKDIRS_MODE_LOG_ONLY) {
+    if (hook_mode.load(std::memory_order_relaxed) == BLOCKDIRS_MODE_LOG_ONLY) {
         LOGW("HOOKED(log-only) %s (top-level on external volume): %s", syscall_name, path);
         return false;   // 只记录，绝不改变行为
     }
     if (burst_guard_should_pass()) {
-        LOGW("MELTED %s (too many blocks in a row), pass through: %s", syscall_name, path);
+        LOGW("MELTED %s (too many blocks), pass through: %s", syscall_name, path);
         return false;
     }
     LOGW("BLOCKED %s (top-level on external volume): %s", syscall_name, path);
-    *err_out = 0;   // 假装成功
+    *result_out = 0;   // 假装成功
     return true;
 }
 
-static int my_mkdir(const char *path, mode_t mode) {
-    SHADOWHOOK_STACK_SCOPE();
+// ============================================================================
+// 代理函数（跳板跳进来的目标）
+//
+// 注意：这里**不调用原函数**，而是直接重做 syscall —— mkdirat/mkdir 本来就是
+// syscall 包装，bionic 的 syscall() 自己会处理 errno。这样完全不需要保存原始
+// 函数指针，也就不会碰 shadowhook 任何内部状态。
+// ============================================================================
 
-    int result = 0;
-    if (handle_top_level_mkdir("mkdir", path, &result)) {
-        return result;
-    }
-    return orig_mkdir(path, mode);
+/** 直接做 mkdirat syscall；返回值语义与 libc 一致（失败返回 -1 并设 errno） */
+static int do_mkdirat(int dirfd, const char *path, mode_t mode) {
+    return (int) syscall(SYS_mkdirat, dirfd, path, mode);
 }
 
-// Hook 后的 mkdirat
-static int my_mkdirat(int dirfd, const char *path, mode_t mode) {
-    SHADOWHOOK_STACK_SCOPE();
-
-    // 相对路径要先经 /proc/self/fd/<dirfd> 还原成绝对路径
+extern "C" __attribute__((used, noinline, visibility("default")))
+int blockdirs_mkdirat(int dirfd, const char *path, mode_t mode) {
     char absolute[BLOCKDIRS_MAX_PATH];
     const char *resolved = resolve_mkdirat_path(dirfd, path, absolute, sizeof(absolute));
-
     if (resolved != nullptr) {
-        int result = 0;
-        if (handle_top_level_mkdir("mkdirat", resolved, &result)) {
-            return result;
+        int blocked_value = 0;
+        if (handle_top_level_mkdir("mkdirat", resolved, &blocked_value)) {
+            return blocked_value;
         }
     }
-    return orig_mkdirat(dirfd, path, mode);
+    return do_mkdirat(dirfd, path, mode);
 }
 
-/** 初始化 shadowhook（只做一次；热重载时不重复初始化） */
-static bool ensure_shadowhook() {
-    if (shadowhook_ready) return true;
-    if (shadowhook_init(SHADOWHOOK_MODE_UNIQUE, false) != 0) {
-        LOGE("shadowhook_init failed, errno=%d", shadowhook_get_errno());
+extern "C" __attribute__((used, noinline, visibility("default")))
+int blockdirs_mkdir(const char *path, mode_t mode) {
+    int blocked_value = 0;
+    if (handle_top_level_mkdir("mkdir", path, &blocked_value)) {
+        return blocked_value;
+    }
+    return do_mkdirat(AT_FDCWD, path, mode);
+}
+
+// ============================================================================
+// 最小 arm64 inline hook
+//
+// 把目标函数入口的 4 字节换成一条 b 指令，跳到我们 mmap 出来的跳板页；
+// 跳板里是 `ldr x16, #8; br x16; .quad <代理函数地址>`，再间接跳进代理函数。
+//
+// 跳板必须 mmap 在目标附近：arm64 的 b 只有 ±128MB，而我们的 .so 在 /data/app 下，
+// 离 libc 很远。所以按 64KB 步进在目标附近找空页，用 MAP_FIXED_NOREPLACE
+// （绝不覆盖已有映射）落下来。
+// ============================================================================
+
+#if defined(__aarch64__)
+
+#define BLOCKDIRS_PAGE_SIZE 4096
+
+/** 跳板与目标之间是否在 b 指令可达范围内 */
+static bool within_branch_range(uintptr_t stub, uintptr_t target) {
+    int64_t delta = (int64_t) stub - (int64_t) (target + 4);
+    return delta >= -(1LL << 27) && delta < (1LL << 27);
+}
+
+/**
+ * 在目标函数附近 mmap 一页可写内存（先 RW，写完再改成 RX）。
+ *
+ * @return 成功返回页地址，失败返回 nullptr
+ */
+static void *map_stub_page(uintptr_t target) {
+    uintptr_t base = target & ~(uintptr_t) (BLOCKDIRS_PAGE_SIZE - 1);
+
+#ifdef MAP_FIXED_NOREPLACE
+    for (int i = 1; i <= 0x80; i++) {
+        for (int dir = -1; dir <= 1; dir += 2) {
+            uintptr_t addr = base + (uintptr_t) dir * (uintptr_t) i * 0x10000;
+            if (addr < 0x10000) {
+                continue;
+            }
+            void *p = mmap((void *) addr, BLOCKDIRS_PAGE_SIZE, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+            if (p != MAP_FAILED) {
+                if (within_branch_range((uintptr_t) p, target)) {
+                    return p;
+                }
+                munmap(p, BLOCKDIRS_PAGE_SIZE);
+            }
+        }
+    }
+#endif
+
+    // 退路：只给 hint，落点自己检查是否还在可达范围内
+    void *p = mmap((void *) base, BLOCKDIRS_PAGE_SIZE, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p != MAP_FAILED) {
+        if (within_branch_range((uintptr_t) p, target)) {
+            return p;
+        }
+        munmap(p, BLOCKDIRS_PAGE_SIZE);
+    }
+    return nullptr;
+}
+
+/** 往跳板页写 `ldr x16, #8; br x16; .quad proxy`，然后改成只读可执行 */
+static bool write_stub(void *page, void *proxy) {
+    uint32_t *code = (uint32_t *) page;
+    code[0] = 0x58000050u;   // ldr x16, #8   （字面量紧跟在 pc+8）
+    code[1] = 0xD61F0200u;   // br  x16
+    uintptr_t addr = (uintptr_t) proxy;
+    memcpy(&code[2], &addr, sizeof(addr));
+
+    if (mprotect(page, BLOCKDIRS_PAGE_SIZE, PROT_READ | PROT_EXEC) != 0) {
         return false;
     }
-    shadowhook_ready = true;
+    __builtin___clear_cache((char *) page, (char *) page + 16);
     return true;
 }
 
-/** 同一个符号已经被 hook 过（上一代实例留下的，或别的模块先 hook 了） */
-static bool is_duplicate_hook_error() {
-    int err = shadowhook_get_errno();
-    return err == SHADOWHOOK_ERRNO_HOOK_UNIQUE_DUP || err == SHADOWHOOK_ERRNO_HOOK_DUP;
+/** 把目标函数入口 4 字节改成 `b stub` */
+static bool patch_entry(void *target, void *stub) {
+    uint32_t *site = (uint32_t *) target;
+    int64_t delta = (int64_t) (uintptr_t) stub - (int64_t) (uintptr_t) (site + 1);
+    if (delta < -(1LL << 27) || delta >= (1LL << 27)) {
+        return false;
+    }
+
+    uintptr_t page_start = (uintptr_t) site & ~(uintptr_t) (BLOCKDIRS_PAGE_SIZE - 1);
+    if (mprotect((void *) page_start, BLOCKDIRS_PAGE_SIZE,
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        return false;
+    }
+
+    *site = 0x14000000u | ((uint32_t) (delta >> 2) & 0x03FFFFFFu);
+    __builtin___clear_cache((char *) site, (char *) site + 4);
+
+    mprotect((void *) page_start, BLOCKDIRS_PAGE_SIZE, PROT_READ | PROT_EXEC);
+    return true;
 }
 
-/** hook 一个 libc 符号；已 hook / 重复时跳过而不报错（幂等，供热重载复用） */
-static void hook_libc_symbol(const char *sym, void *new_addr, void **orig_addr, void **stub_out) {
-    if (*stub_out != nullptr) return;
-
-    void *stub = shadowhook_hook_sym_name("libc.so", sym, new_addr, orig_addr);
-    if (stub != nullptr) {
-        *stub_out = stub;
-        LOGI("%s hooked, orig=%p", sym, *orig_addr);
+static void install_one(const char *symbol, void *proxy) {
+    void *target = dlsym(RTLD_DEFAULT, symbol);
+    if (target == nullptr) {
+        LOGE("%s: dlsym 失败", symbol);
         return;
     }
-    if (is_duplicate_hook_error()) {
-        LOGW("%s 已被 hook 过（上一代实例或其它模块），跳过", sym);
+    void *page = map_stub_page((uintptr_t) target);
+    if (page == nullptr) {
+        LOGE("%s: 找不到可用的跳板页（b 指令 ±128MB 内没有空页）", symbol);
         return;
     }
-    LOGE("%s hook failed, errno=%d", sym, shadowhook_get_errno());
+    if (!write_stub(page, proxy)) {
+        LOGE("%s: 跳板页写不进去（mprotect 失败）", symbol);
+        munmap(page, BLOCKDIRS_PAGE_SIZE);
+        return;
+    }
+    if (!patch_entry(target, page)) {
+        LOGE("%s: 入口改写失败（mprotect / 分支越界）", symbol);
+        munmap(page, BLOCKDIRS_PAGE_SIZE);
+        return;
+    }
+    LOGI("%s hooked: target=%p stub=%p proxy=%p", symbol, target, page, proxy);
 }
+
+#else  // 非 arm64：只保证编译通过，不做任何 patch
+
+static void install_one(const char *, void *) {
+    LOGE("当前 ABI 不支持内联 hook（只实现了 arm64）");
+}
+
+#endif
+
+// ============================================================================
+// JNI 入口
+// ============================================================================
 
 extern "C" JNIEXPORT void JNICALL
-Java_top_yixiangren_blockdirs_nativebridge_BlockDirsNative_installNativeHook(JNIEnv *env, jclass clazz, jint mode) {
-    hook_mode = (mode == BLOCKDIRS_MODE_LOG_ONLY) ? BLOCKDIRS_MODE_LOG_ONLY : BLOCKDIRS_MODE_BLOCK;
-    LOGI("installNativeHook: mode=%s", hook_mode == BLOCKDIRS_MODE_BLOCK ? "block" : "log-only(diagnostics)");
+Java_top_yixiangren_blockdirs_nativebridge_BlockDirsNative_installNativeHook(
+        JNIEnv *env, jobject thiz, jint mode) {
+    (void) env;
+    (void) thiz;
 
-    if (!ensure_shadowhook()) return;
+    hook_mode.store(mode == BLOCKDIRS_MODE_LOG_ONLY ? BLOCKDIRS_MODE_LOG_ONLY
+                                                   : BLOCKDIRS_MODE_BLOCK,
+                    std::memory_order_relaxed);
+    LOGI("installNativeHook: mode=%s",
+         mode == BLOCKDIRS_MODE_LOG_ONLY ? "log-only(diagnostics)" : "block");
 
-    hook_libc_symbol("mkdir", (void *) my_mkdir, (void **) &orig_mkdir, &mkdir_stub);
-    hook_libc_symbol("mkdirat", (void *) my_mkdirat, (void **) &orig_mkdirat, &mkdirat_stub);
+    if (hooks_installed.exchange(true, std::memory_order_acq_rel)) {
+        return;   // 幂等（热重载后新一代实例再调进来时只更新模式）
+    }
+
+    install_one("mkdirat", (void *) blockdirs_mkdirat);
+    install_one("mkdir", (void *) blockdirs_mkdir);
 }

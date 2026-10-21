@@ -36,7 +36,7 @@ object BlockDirsNative {
      * 幂等安装：同一个进程内重复调用（多个生命周期回调、热重载后的新一代实例）时只装一次。
      *
      * @param mode [MODE_BLOCK] 或 [MODE_LOG_ONLY]
-     * @throws Throwable native 库加载或 ShadowHook 初始化失败时抛出，由调用方记录
+     * @throws Throwable native 库加载或入口改写失败时抛出，由调用方记录
      */
     @Synchronized
     fun installOnce(mode: Int) {
@@ -47,7 +47,10 @@ object BlockDirsNative {
 
     /**
      * 在目标进程内安装 libc `mkdir` / `mkdirat` 的 inline hook。
-     * 由 ShadowHook 完成。
+     *
+     * 实现见 native/src/main/cpp/blockdirs.cpp：mmap 一页跳板（在目标 ±128MB 内），
+     * 把目标函数入口换成 `b 跳板`，跳板 `ldr x16, #8; br x16` 进代理函数；
+     * 代理函数不调原函数，直接重做 syscall。完全不依赖 shadowhook 的 TLS 机制。
      */
     private external fun installNativeHook(mode: Int)
 }
