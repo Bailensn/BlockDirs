@@ -25,9 +25,13 @@ Android 的 MediaProvider（`com.android.providers.media.module`，UID `10176`�
 | `com.android.providers.media[.module]`（MediaProvider） | 拦 `Music` / `Pictures` / `DCIM` / `Movies` / `Downloads` … 的创建 | **真拦截**（native 主 + Java 兜底） |
 | `system`（system_server 的虚拟包名，**默认不勾**） | 排查用：记录谁在卷根建目录 | **只记日志，绝不改变返回值** |
 
+> ⚠️ **当前状态：native 层已被编译期开关关闭**（`NATIVE_HOOK_ENABLED = false`）。
+> 它在真机上连着三次把 MediaProvider（FUSE 守护进程）打崩、连带内部存储挂不上，
+> 在能安全验证之前不再启用。现在生效的只有下面的 Java 层，**不会碰 libc、不会影响开机**。
+
 两层拦截：
 
-1. **native 层（主拦截，自研最小 inline hook）**
+1. **native 层（当前禁用，自研最小 inline hook）**
    把目标进程内 libc 的 `mkdir` / `mkdirat` 入口 4 字节改成 `b 跳板`；跳板（mmap 在目标
    ±128MB 范围内）里是 `ldr x16, #8; br x16; .quad 代理函数`；代理函数**不调用原函数**，
    直接重做一次 `syscall(SYS_mkdirat, ...)`，所以不需要保存原函数指针、也不用搬迁指令。
